@@ -73,3 +73,15 @@ yarn-error.log
 !.yarn/releases
 !.yarn/sdks
 !.yarn/versions
+
+# local env + secrets
+.env
+.env.production
+android/app/google-services.json
+# local crash/replay logs
+android/hs_err_pid*.log
+android/replay_pid*.log
+
+# local data dumps with secrets
+data copy.json
+data.json

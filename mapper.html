@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Plot Mapping Digitizer</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: sans-serif; display: flex; flex-direction: column; align-items: center; background: #f0f0f0; margin: 0; padding: 20px; }
+    #workspace { position: relative; display: inline-block; box-shadow: 0 4px 8px rgba(0,0,0,0.2); margin-top: 12px; }
+    canvas { position: absolute; top: 0; left: 0; cursor: crosshair; }
+    textarea { width: 100%; max-width: 860px; height: 260px; margin-top: 20px; font-family: monospace; padding: 10px; }
+
+    .instructions { text-align: center; margin-bottom: 10px; max-width: 760px; background: #fff; padding: 12px 16px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); font-size: 14px; }
+
+    /* ── Mode bar ── */
+    .mode-bar { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; justify-content: center; }
+    .mode-btn { padding: 10px 18px; font-size: 15px; font-weight: bold; cursor: pointer; border-radius: 6px; border: 2px solid transparent; background: #dee2e6; color: #333; transition: all .15s; }
+    .mode-btn.active { border-color: #333; background: #343a40; color: #fff; }
+
+    /* ── Action bar ── */
+    .action-bar { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; justify-content: center; }
+    .action-bar button { padding: 9px 16px; font-size: 14px; cursor: pointer; border-radius: 5px; border: 1px solid #ccc; background: #fff; }
+    #exportBtn { background: #28a745; color: #fff; border-color: #28a745; font-weight: bold; }
+    #undoPlotBtn { background: #dc3545; color: #fff; border-color: #dc3545; }
+
+    .stamp-info { font-size: 13px; color: #555; margin-top: 6px; min-height: 18px; text-align: center; }
+
+    /* ── Toast ── */
+    #toast {
+      position: fixed; bottom: 28px; right: 28px;
+      background: #1e1e1e; color: #fff;
+      padding: 10px 20px; border-radius: 8px;
+      font-size: 15px; font-weight: bold;
+      opacity: 0; pointer-events: none;
+      transition: opacity 0.25s; z-index: 9999;
+      border-left: 4px solid #28a745;
+    }
+    #toast.show { opacity: 1; }
+  </style>
+</head>
+<body>
+
+<div class="instructions">
+  <strong>Manual</strong> — click each corner, then <kbd>Enter</kbd> to complete. &nbsp;|&nbsp;
+  <strong>Draw Box</strong> — click &amp; drag to draw a rectangle, release to complete. &nbsp;|&nbsp;
+  <strong>Stamp</strong> — reuses last box size; click anywhere to place it.<br>
+  <kbd>M</kbd> Manual &nbsp; <kbd>D</kbd> Draw Box &nbsp; <kbd>P</kbd> Stamp &nbsp; <kbd>Enter</kbd> Complete (manual) &nbsp; <kbd>Esc</kbd> Clear &nbsp; <kbd>Z</kbd> Undo last
+</div>
+
+<div class="mode-bar">
+  <button class="mode-btn active" id="btn-manual"   onclick="setMode('manual')">✏️ Manual (M)</button>
+  <button class="mode-btn"        id="btn-drawbox"  onclick="setMode('drawbox')">⬜ Draw Box (D)</button>
+  <button class="mode-btn"        id="btn-stamp"    onclick="setMode('stamp')">🔲 Stamp (P)</button>
+</div>
+
+<div class="stamp-info" id="stampInfo">No stamp saved yet — draw a box first, then switch to Stamp mode.</div>
+
+<div class="action-bar">
+  <button onclick="clearCurrent()">Clear Current (Esc)</button>
+  <button id="undoPlotBtn" onclick="undoLastPlot()">Undo Last Plot (Z)</button>
+  <button id="exportBtn" onclick="exportJSON()">Export JSON</button>
+</div>
+
+<div id="toast"></div>
+
+<div id="workspace">
+  <img id="mapImage" src="./frontend/src/assets/Golden City.jpg" draggable="false"
+       style="display:block; width:900px; height:auto;" />
+  <canvas id="mapCanvas"></canvas>
+</div>
+
+<textarea id="output" readonly placeholder="Exported JSON will appear here after clicking Export JSON..."></textarea>
+
+<script>
+  const canvas  = document.getElementById('mapCanvas');
+  const ctx     = canvas.getContext('2d');
+  const img     = document.getElementById('mapImage');
+  const stampInfoEl = document.getElementById('stampInfo');
+
+  // ── State ────────────────────────────────────────────────────────────────────
+  let mode          = 'manual';   // 'manual' | 'drawbox' | 'stamp'
+  let currentPoints = [];
+  const completedPlots = [];
+
+  // Draw-box drag state
+  let isDragging = false;
+  let dragStart  = null;
+  let dragEnd    = null;
+
+  // Stamp state — saved size from last completed draw-box or manual rect
+  let stampSize     = null;   // { w, h } in canvas display pixels
+  let mousePos      = { x: 0, y: 0 };
+
+  // Auto-increment state
+  let lastPlotNumber = null;  // string of last entered plot number
+
+  // ── Toast ─────────────────────────────────────────────────────────────────────
+  let _toastTimer = null;
+  function showToast(msg) {
+    const t = document.getElementById('toast');
+    t.textContent = msg;
+    t.classList.add('show');
+    clearTimeout(_toastTimer);
+    _toastTimer = setTimeout(() => t.classList.remove('show'), 2000);
+  }
+
+  // ── Mode switching ───────────────────────────────────────────────────────────
+  function setMode(m) {
+    mode = m;
+    isDragging = false; dragStart = dragEnd = null;
+    currentPoints = [];
+    ['manual','drawbox','stamp'].forEach(id => {
+      document.getElementById('btn-' + id).classList.toggle('active', id === m);
+    });
+    updateStampInfo();
+    draw();
+  }
+
+  function updateStampInfo() {
+    if (!stampSize) {
+      stampInfoEl.textContent = 'No stamp saved yet — draw a box first, then switch to Stamp mode.';
+    } else {
+      const scale = getScale();
+      const realW = Math.round(stampSize.w * scale.x);
+      const realH = Math.round(stampSize.h * scale.y);
+      stampInfoEl.textContent = `Stamp size: ${stampSize.w}×${stampSize.h} px on screen  (${realW}×${realH} real px).  Click anywhere to place.`;
+    }
+  }
+
+  // ── Canvas sizing ────────────────────────────────────────────────────────────
+  function getScale() {
+    return { x: img.naturalWidth / img.offsetWidth, y: img.naturalHeight / img.offsetHeight };
+  }
+
+  function sizeCanvas() {
+    canvas.width  = img.offsetWidth;
+    canvas.height = img.offsetHeight;
+    draw();
+  }
+
+  img.addEventListener('load', sizeCanvas);
+  if (img.complete && img.naturalWidth) sizeCanvas();
+  window.addEventListener('resize', sizeCanvas);
+
+  // ── Keyboard shortcuts ───────────────────────────────────────────────────────
+  window.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter')              { e.preventDefault(); completePolygon(); }
+    if (e.key === 'Escape')             clearCurrent();
+    if (e.key === 'z' || e.key === 'Z') undoLastPlot();
+    if (e.key === 'm' || e.key === 'M') setMode('manual');
+    if (e.key === 'd' || e.key === 'D') setMode('drawbox');
+    if (e.key === 'p' || e.key === 'P') setMode('stamp');
+  });
+
+  // ── Mouse events ─────────────────────────────────────────────────────────────
+  function canvasXY(e) {
+    const r = canvas.getBoundingClientRect();
+    return { x: Math.round(e.clientX - r.left), y: Math.round(e.clientY - r.top) };
+  }
+
+  canvas.addEventListener('mousemove', function(e) {
+    const p = canvasXY(e);
+    mousePos = p;
+    if (isDragging) { dragEnd = p; draw(); }
+    if (mode === 'stamp' && stampSize) draw();
+  });
+
+  canvas.addEventListener('mousedown', function(e) {
+    const p = canvasXY(e);
+
+    if (mode === 'manual') {
+      currentPoints.push(p);
+      draw();
+      return;
+    }
+
+    if (mode === 'drawbox') {
+      isDragging = true;
+      dragStart  = p;
+      dragEnd    = p;
+      return;
+    }
+
+    if (mode === 'stamp') {
+      if (!stampSize) { alert('Draw a box first, then switch to Stamp mode.'); return; }
+      // Place stamp centered on click
+      const hw = stampSize.w / 2, hh = stampSize.h / 2;
+      currentPoints = [
+        { x: Math.round(p.x - hw), y: Math.round(p.y - hh) },
+        { x: Math.round(p.x + hw), y: Math.round(p.y - hh) },
+        { x: Math.round(p.x + hw), y: Math.round(p.y + hh) },
+        { x: Math.round(p.x - hw), y: Math.round(p.y + hh) },
+      ];
+      draw();
+      setTimeout(() => completePolygon(true), 60); // true = auto-increment
+    }
+  });
+
+  canvas.addEventListener('mouseup', function(e) {
+    if (mode !== 'drawbox' || !isDragging) return;
+    isDragging = false;
+    const p = canvasXY(e);
+    dragEnd = p;
+
+    const x1 = Math.min(dragStart.x, p.x), y1 = Math.min(dragStart.y, p.y);
+    const x2 = Math.max(dragStart.x, p.x), y2 = Math.max(dragStart.y, p.y);
+
+    if ((x2 - x1) < 5 || (y2 - y1) < 5) { dragStart = dragEnd = null; draw(); return; }
+
+    // Save stamp size from this draw
+    stampSize = { w: x2 - x1, h: y2 - y1 };
+    updateStampInfo();
+
+    currentPoints = [
+      { x: x1, y: y1 }, { x: x2, y: y1 },
+      { x: x2, y: y2 }, { x: x1, y: y2 }
+    ];
+    dragStart = dragEnd = null;
+    draw();
+    setTimeout(() => completePolygon(false), 60); // always ask for number on new drawn box
+  });
+
+  // ── Draw ─────────────────────────────────────────────────────────────────────
+  function draw() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // Completed plots
+    completedPlots.forEach(plot => {
+      ctx.beginPath();
+      plot.coordinates.forEach((pt, i) => i === 0 ? ctx.moveTo(pt.x, pt.y) : ctx.lineTo(pt.x, pt.y));
+      ctx.closePath();
+      ctx.fillStyle   = 'rgba(255, 220, 0, 0.3)';
+      ctx.fill();
+      ctx.strokeStyle = '#333';
+      ctx.lineWidth   = 0.5;
+      ctx.stroke();
+
+      const cx = plot.coordinates.reduce((s,p) => s + p.x, 0) / plot.coordinates.length;
+      const cy = plot.coordinates.reduce((s,p) => s + p.y, 0) / plot.coordinates.length;
+      ctx.fillStyle = '#000';
+      ctx.font      = 'bold 11px Arial';
+      ctx.fillText(plot.plotNumber, cx - 8, cy + 4);
+    });
+
+    // Current in-progress points (manual mode)
+    if (currentPoints.length > 0 && !isDragging) {
+      ctx.beginPath();
+      currentPoints.forEach((pt, i) => i === 0 ? ctx.moveTo(pt.x, pt.y) : ctx.lineTo(pt.x, pt.y));
+      if (currentPoints.length === 4) ctx.closePath();
+      ctx.strokeStyle = 'red';
+      ctx.lineWidth   = 1;
+      ctx.stroke();
+      currentPoints.forEach(pt => {
+        ctx.beginPath();
+        ctx.arc(pt.x, pt.y, 2, 0, Math.PI * 2);
+        ctx.fillStyle = 'red';
+        ctx.fill();
+      });
+    }
+
+    // Drag preview (draw-box mode)
+    if (isDragging && dragStart && dragEnd) {
+      const x = Math.min(dragStart.x, dragEnd.x), y = Math.min(dragStart.y, dragEnd.y);
+      const w = Math.abs(dragEnd.x - dragStart.x),  h = Math.abs(dragEnd.y - dragStart.y);
+      ctx.setLineDash([4, 3]);
+      ctx.strokeStyle = '#e63946';
+      ctx.lineWidth   = 1.5;
+      ctx.strokeRect(x, y, w, h);
+      ctx.fillStyle   = 'rgba(230, 57, 70, 0.1)';
+      ctx.fillRect(x, y, w, h);
+      ctx.setLineDash([]);
+
+      // Live size label
+      ctx.fillStyle = '#e63946';
+      ctx.font      = 'bold 11px Arial';
+      ctx.fillText(`${w}×${h}`, x + 4, y - 4);
+    }
+
+    // Stamp preview (stamp mode)
+    if (mode === 'stamp' && stampSize && !isDragging) {
+      const hw = stampSize.w / 2, hh = stampSize.h / 2;
+      const sx = mousePos.x - hw, sy = mousePos.y - hh;
+      ctx.setLineDash([5, 4]);
+      ctx.strokeStyle = '#0077ff';
+      ctx.lineWidth   = 1.5;
+      ctx.strokeRect(sx, sy, stampSize.w, stampSize.h);
+      ctx.fillStyle   = 'rgba(0, 119, 255, 0.08)';
+      ctx.fillRect(sx, sy, stampSize.w, stampSize.h);
+      ctx.setLineDash([]);
+    }
+  }
+
+  // ── Plot actions ─────────────────────────────────────────────────────────────
+  function clearCurrent() {
+    currentPoints = [];
+    isDragging = false; dragStart = dragEnd = null;
+    draw();
+  }
+
+  function undoLastPlot() {
+    if (completedPlots.length > 0) {
+      const r = completedPlots.pop();
+      // Roll back lastPlotNumber to the one before
+      lastPlotNumber = completedPlots.length > 0 ? completedPlots[completedPlots.length - 1].plotNumber : null;
+      showToast(`↩ Removed Plot ${r.plotNumber}`);
+      draw();
+    } else {
+      alert('No completed plots to undo.');
+    }
+  }
+
+  function completePolygon(autoIncrement = false) {
+    if (currentPoints.length < 3) {
+      if (mode === 'manual') alert('Need at least 3 points to complete a plot.');
+      return;
+    }
+
+    let num;
+
+    if (autoIncrement && lastPlotNumber !== null) {
+      // Try numeric increment, fall back to prompt if non-numeric
+      const parsed = parseInt(lastPlotNumber, 10);
+      if (!isNaN(parsed)) {
+        num = String(parsed + 1);
+      }
+    }
+
+    if (!num) {
+      // Ask the user
+      const hint = lastPlotNumber !== null ? ` (last was ${lastPlotNumber})` : '';
+      num = prompt(`Enter Plot Number${hint}:`);
+      if (!num) { clearCurrent(); return; }
+    }
+
+    lastPlotNumber = num;
+    completedPlots.push({ plotNumber: num, status: 'vacant', coordinates: [...currentPoints] });
+    currentPoints = [];
+    draw();
+    showToast(`✓ Plot ${num} saved`);
+  }
+
+  // ── Export ───────────────────────────────────────────────────────────────────
+  function exportJSON() {
+    if (completedPlots.length === 0) { alert('No plots mapped yet!'); return; }
+    const scale = getScale();
+
+    const scaledPlots = completedPlots
+      .map(plot => ({
+        ...plot,
+        coordinates: plot.coordinates.map(pt => ({
+          x: Math.round(pt.x * scale.x),
+          y: Math.round(pt.y * scale.y)
+        }))
+      }))
+      // Sort by plot number — numeric where possible, alphabetic otherwise
+      .sort((a, b) => {
+        const na = parseInt(a.plotNumber, 10), nb = parseInt(b.plotNumber, 10);
+        if (!isNaN(na) && !isNaN(nb)) return na - nb;
+        return a.plotNumber.localeCompare(b.plotNumber);
+      });
+
+    const out = document.getElementById('output');
+    out.value = 'const plots = ' + JSON.stringify(scaledPlots, null, 2) + ';';
+    out.select();
+    try { document.execCommand('copy'); alert(`${scaledPlots.length} plots exported & copied to clipboard!\nPaste into backend/seed.js`); }
+    catch(e) { console.warn(e); }
+  }
+</script>
+</body>
+</html>

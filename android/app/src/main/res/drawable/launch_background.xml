@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Full-screen dark navy background -->
+    <item android:drawable="@color/splash_bg" />
+
+    <!-- App icon — centered on screen -->
+    <item android:gravity="center">
+        <bitmap
+            android:src="@drawable/splash_icon"
+            android:gravity="center" />
+    </item>
+
+    <!-- GOLDEN CITY + BM TAILORS — bottom of screen, 60dp above navigation bar -->
+    <item
+        android:gravity="bottom|center_horizontal"
+        android:bottom="60dp">
+        <bitmap
+            android:src="@drawable/splash_text"
+            android:gravity="center" />
+    </item>
+
+</layer-list>
