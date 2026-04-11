@@ -14,23 +14,35 @@ import {
 } from 'react-native';
 import Icon from 'react-native-vector-icons/MaterialIcons';
 import { useRoute } from '@react-navigation/native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useOnAppForeground } from '../hooks/useOnAppForeground';
 import api from '../services/api';
 import socket from '../services/socket';
 import { useTheme } from '../context/ThemeContext';
 import { useAlert } from '../context/AlertContext';
-import { formatRupee, numOrZero } from '../utils/formatting';
+import { numOrZero } from '../utils/formatting';
 import { resolveScholarPricing, resolveRegularPricing } from '../utils/pricingHelpers';
+import { STATUS_LABELS } from '../constants/statusColors';
+import {
+  EMI_INSTALLMENTS_LABEL,
+  PlotDetailsEmiSchedule,
+  PricingStatRow,
+  PricingStatTextRow,
+  EmiRupeeText,
+  fmtRsInr,
+  createPlotDetailsPricingStyles,
+} from '../components/plotDetailsPricingUi';
 
 const COL = {
   sr: 48,
-  plot: 76,
-  status: 92,
-  area: 100,
-  totalCost: 124,
-  advance: 112,
-  emi: 108,
-  cash: 128,
+  plot: 72,
+  status: 86,
+  area: 86,
+  totalCost: 116,
+  advance: 104,
+  balance: 120,
+  emi: 136,
+  cash: 116,
 };
 
 const TABLE_MIN_CONTENT_WIDTH = Object.values(COL).reduce((a, w) => a + w, 0);
@@ -39,7 +51,12 @@ const MultiPlotSummaryScreen = () => {
   const route = useRoute();
   const { selectedPlotIds = [] } = route.params || {};
   const { colors, isDark } = useTheme();
-  const styles = useMemo(() => getStyles(colors, isDark), [colors, isDark]);
+  const insets = useSafeAreaInsets();
+  const styles = useMemo(() => {
+    const shared = createPlotDetailsPricingStyles(colors, isDark);
+    const local = getExtraStyles(colors, isDark);
+    return { ...shared, ...local };
+  }, [colors, isDark]);
   const { showAlert } = useAlert();
 
   const [loading, setLoading] = useState(true);
@@ -117,12 +134,10 @@ const MultiPlotSummaryScreen = () => {
   const handleScholarToggle = () => {
     if (isScholarMode) {
       setScholarPlotId(null);
+    } else if (selectedPlots.length === 1) {
+      setScholarPlotId(selectedPlots[0]._id);
     } else {
-      if (selectedPlots.length === 1) {
-        setScholarPlotId(selectedPlots[0]._id);
-      } else {
-        setShowPicker(true);
-      }
+      setShowPicker(true);
     }
   };
 
@@ -138,20 +153,65 @@ const MultiPlotSummaryScreen = () => {
         const cat = useScholar
           ? resolveScholarPricing(p.categoryPricing)
           : resolveRegularPricing(p.categoryPricing);
+        const total = numOrZero(cat.totalPlotCost);
+        const adv = numOrZero(cat.advance);
+        const emiRaw = cat.emiAmount;
+        const emiNum =
+          emiRaw != null && !Number.isNaN(Number(emiRaw)) ? Number(emiRaw) : null;
+        const lastRaw = cat.lastEmiAmount;
+        const lastNum =
+          lastRaw != null && !Number.isNaN(Number(lastRaw)) ? Number(lastRaw) : null;
         return {
           id: p._id,
           plotNumber: p.plotNumber,
           areaSqFt: p.areaSqFt,
           totalPlotCost: cat.totalPlotCost,
           advance: cat.advance,
-          emiAmount: cat.emiAmount,
+          emiAmount: emiNum,
+          lastEmiAmount: lastNum,
+          balanceForEmiRow: Number.isFinite(total) && Number.isFinite(adv) ? Math.max(0, total - adv) : null,
           cashOneTimePrice: cat.cashOneTimePrice,
+          cashDiscount: cat.cashDiscount,
           status: p.status,
           isScholar: useScholar,
         };
       }),
     [selectedPlots, scholarPlotId]
   );
+
+  const plotNumbersJoined = useMemo(
+    () => tableRows.map((r) => String(r.plotNumber)).join(', '),
+    [tableRows]
+  );
+
+  /** Combined month 1–35 = sum(emi); month 36 = sum(lastEmi ?? emi). ×36-only plots use emi every month. */
+  const combinedEmiSchedule = useMemo(() => {
+    if (tableRows.length === 0) {
+      return { sumEmi: null, sumMonth36: null, allEqual36: true };
+    }
+    let sumEmi = 0;
+    let sumMonth36 = 0;
+    let hasEmi = false;
+    let allEqual36 = true;
+    for (const r of tableRows) {
+      const emi = r.emiAmount != null ? Number(r.emiAmount) : NaN;
+      if (Number.isFinite(emi)) {
+        hasEmi = true;
+        sumEmi += emi;
+      }
+      if (r.lastEmiAmount != null && Number.isFinite(Number(r.lastEmiAmount))) {
+        allEqual36 = false;
+        sumMonth36 += Number(r.lastEmiAmount);
+      } else if (Number.isFinite(emi)) {
+        sumMonth36 += emi;
+      }
+    }
+    return {
+      sumEmi: hasEmi ? sumEmi : null,
+      sumMonth36: hasEmi ? sumMonth36 : null,
+      allEqual36,
+    };
+  }, [tableRows]);
 
   const totals = useMemo(() => {
     return tableRows.reduce(
@@ -161,6 +221,7 @@ const MultiPlotSummaryScreen = () => {
         advance: acc.advance + numOrZero(r.advance),
         emiAmount: acc.emiAmount + numOrZero(r.emiAmount),
         cashOneTimePrice: acc.cashOneTimePrice + numOrZero(r.cashOneTimePrice),
+        cashDiscount: acc.cashDiscount + numOrZero(r.cashDiscount),
       }),
       {
         areaSqFt: 0,
@@ -168,14 +229,40 @@ const MultiPlotSummaryScreen = () => {
         advance: 0,
         emiAmount: 0,
         cashOneTimePrice: 0,
+        cashDiscount: 0,
       }
     );
   }, [tableRows]);
 
+  const balanceForEmi =
+    Number.isFinite(totals.totalPlotCost) && Number.isFinite(totals.advance)
+      ? Math.max(0, totals.totalPlotCost - totals.advance)
+      : null;
+
   const { width: windowWidth } = useWindowDimensions();
   const tableWidth = useMemo(
     () => Math.max(TABLE_MIN_CONTENT_WIDTH, windowWidth + 120),
-    [windowWidth],
+    [windowWidth]
+  );
+
+  const pricingCardBandStyle = isScholarMode
+    ? styles.pricingCardBandScholar
+    : styles.pricingCardBandRegular;
+  const pricingIconColor = isScholarMode
+    ? isDark
+      ? '#6ee7b7'
+      : '#047857'
+    : isDark
+      ? '#fcd34d'
+      : '#b45309';
+
+  const countPillStyle = useMemo(
+    () => ({
+      backgroundColor: isDark ? '#1e293b' : '#f1f5f9',
+      borderWidth: 1,
+      borderColor: isDark ? '#94a3b8' : '#64748b',
+    }),
+    [isDark]
   );
 
   if (loading) {
@@ -186,129 +273,254 @@ const MultiPlotSummaryScreen = () => {
     );
   }
 
-  const scholarPlot = isScholarMode
-    ? selectedPlots.find((p) => p._id === scholarPlotId)
-    : null;
+  const scholarPlot = isScholarMode ? selectedPlots.find((p) => p._id === scholarPlotId) : null;
 
   return (
-    <View style={styles.screen}>
-      <ScrollView
-        contentContainerStyle={styles.scrollContent}
-        refreshControl={
-          <RefreshControl refreshing={refreshing} onRefresh={onRefresh} colors={[colors.primary]} />
-        }
-        nestedScrollEnabled
+    <View style={[styles.screenRoot, { backgroundColor: colors.background }]}>
+      <View
+        style={[
+          styles.fixedPlotHeader,
+          {
+            paddingTop: Math.max(insets.top, 10),
+            backgroundColor: colors.background,
+            borderBottomColor: colors.border,
+          },
+        ]}
       >
-        <View style={styles.headRow}>
-          <Text style={styles.title}>Multiple Plot Info</Text>
-          <View style={styles.countPill}>
-            <Text style={styles.countPillText}>{tableRows.length}</Text>
+        <View style={styles.summaryRow}>
+          <View style={[styles.summaryCard, styles.summaryCardPlot, styles.summaryCardPlotNumbersWrap]}>
+            <Text style={styles.summaryCardLabelPlot}>Plot numbers</Text>
+            <Text
+              style={styles.summaryCardValuePlotNumbers}
+              numberOfLines={4}
+              ellipsizeMode="tail"
+              adjustsFontSizeToFit
+              minimumFontScale={0.42}
+              maxFontSizeMultiplier={1.12}
+            >
+              {plotNumbersJoined || '—'}
+            </Text>
+          </View>
+          <View style={[styles.summaryCard, styles.summaryCardArea]}>
+            <Text style={styles.summaryCardLabelArea}>Total area (Sq. Ft.)</Text>
+            <Text style={styles.summaryCardValueArea} numberOfLines={1}>
+              {totals.areaSqFt > 0 ? totals.areaSqFt.toLocaleString('en-IN') : '—'}
+            </Text>
           </View>
         </View>
 
-        <View style={styles.toggleRow}>
+        <View style={styles.rateBandRow}>
           <TouchableOpacity
             style={[
-              styles.toggleBtn,
-              !isScholarMode && styles.toggleBtnActiveRegular,
-              isScholarMode && styles.toggleBtnInactive,
+              styles.compactBandBtn,
+              styles.compactBandBtn40,
+              !isScholarMode ? styles.compactBandBtnActiveRegular : styles.compactBandBtnInactive,
             ]}
             onPress={() => setScholarPlotId(null)}
+            activeOpacity={0.9}
           >
-            <Text style={[styles.toggleText, !isScholarMode && styles.toggleTextActive]}>Regular</Text>
+            <Icon
+              name="person-outline"
+              size={17}
+              color={!isScholarMode ? '#0f172a' : colors.textSecondary}
+            />
+            <Text
+              style={[styles.compactBandLabel, !isScholarMode && styles.compactBandTextActiveOnBright]}
+              numberOfLines={1}
+            >
+              Regular
+            </Text>
           </TouchableOpacity>
           <TouchableOpacity
             style={[
-              styles.toggleBtn,
-              isScholarMode && styles.toggleBtnActiveScholar,
-              !isScholarMode && styles.toggleBtnInactive,
+              styles.compactBandBtn,
+              styles.compactBandBtn40,
+              isScholarMode ? styles.compactBandBtnActiveScholar : styles.compactBandBtnInactive,
             ]}
             onPress={handleScholarToggle}
+            activeOpacity={0.9}
+            accessibilityLabel="Aalim, Hafiz, and Imam rates"
           >
-            <Text style={[styles.toggleText, isScholarMode && styles.toggleTextActive]}>
-              Aalim / Hafiz / Imam
+            <Icon
+              name="menu-book"
+              size={17}
+              color={isScholarMode ? '#052e16' : colors.textSecondary}
+            />
+            <Text
+              style={[styles.compactBandLabel, isScholarMode && styles.compactBandTextActiveOnBright]}
+              numberOfLines={1}
+            >
+              Aalim / Hafiz
             </Text>
           </TouchableOpacity>
+          <View style={[styles.statusPillInline, countPillStyle]}>
+            <Text
+              style={[styles.statusPillInlineText, { color: colors.text }]}
+              numberOfLines={1}
+              ellipsizeMode="tail"
+            >
+              {tableRows.length === 1 ? '1 plot' : `${tableRows.length} plots`}
+            </Text>
+          </View>
         </View>
 
-        {isScholarMode && scholarPlot && (
-          <View style={styles.scholarBanner}>
-            <Icon name="auto-stories" size={18} color="#059669" />
-            <Text style={styles.scholarBannerText}>
-              Scholar discount on Plot No. {scholarPlot.plotNumber} only
+        {isScholarMode && scholarPlot ? (
+          <View style={[styles.scholarBanner, { borderColor: isDark ? '#059669' : '#a7f3d0' }]}>
+            <Icon name="auto-stories" size={18} color={isDark ? '#6ee7b7' : '#047857'} />
+            <Text style={[styles.scholarBannerText, { color: isDark ? '#a7f3d0' : '#065f46' }]}>
+              Scholar rate on Plot No. {scholarPlot.plotNumber} only
             </Text>
             <TouchableOpacity onPress={() => setShowPicker(true)} style={styles.scholarChangeBtn}>
               <Text style={styles.scholarChangeBtnText}>Change</Text>
             </TouchableOpacity>
           </View>
-        )}
+        ) : null}
+      </View>
 
-        <View style={styles.summaryGrid}>
-          <SummaryTile label="Total area" value={`${totals.areaSqFt.toLocaleString()} sq ft`} styles={styles} />
-          <SummaryTile label="Total plot cost" value={formatRupee(totals.totalPlotCost)} styles={styles} />
-          <SummaryTile label="Total advance" value={formatRupee(totals.advance)} styles={styles} />
-          <SummaryTile label="Total EMI" value={formatRupee(totals.emiAmount)} styles={styles} />
-          <SummaryTile
-            label="Total cash rate"
-            value={formatRupee(totals.cashOneTimePrice)}
-            styles={styles}
-          />
-        </View>
-
-        <View style={[styles.tableOuter, { borderColor: colors.border }]}>
-          <ScrollView
-            horizontal
-            showsHorizontalScrollIndicator
-            nestedScrollEnabled
-            bounces
-            directionalLockEnabled={Platform.OS === 'ios'}
-            style={styles.tableHorizontalScroll}
-            contentContainerStyle={styles.tableHorizontalContent}
-          >
-            <View style={{ width: tableWidth }}>
-              <View style={[styles.tableRow, styles.tableHeader, { width: tableWidth }]}>
-                <Cell text="Sr" width={COL.sr} header styles={styles} />
-                <Cell text="Plot No." width={COL.plot} header styles={styles} />
-                <Cell text="Status" width={COL.status} header styles={styles} />
-                <Cell text="Area" width={COL.area} header styles={styles} />
-                <Cell text="Total Cost" width={COL.totalCost} header styles={styles} />
-                <Cell text="Advance" width={COL.advance} header styles={styles} />
-                <Cell text="EMI" width={COL.emi} header styles={styles} />
-                <Cell text="Cash Rate" width={COL.cash} header styles={styles} />
-              </View>
-              {tableRows.map((r, i) => (
+      <ScrollView
+        style={styles.detailsScroll}
+        contentContainerStyle={[
+          styles.detailsScrollContent,
+          { paddingBottom: Math.max(insets.bottom, 28) },
+        ]}
+        showsVerticalScrollIndicator
+        refreshControl={
+          <RefreshControl refreshing={refreshing} onRefresh={onRefresh} colors={[colors.primary]} />
+        }
+        nestedScrollEnabled
+      >
+        {tableRows.length === 0 ? (
+          <View style={[styles.emptyCard, { backgroundColor: colors.surface, borderColor: colors.border }]}>
+            <Text style={[styles.emptyCardText, { color: colors.textSecondary }]}>
+              No matching plots for this selection.
+            </Text>
+          </View>
+        ) : (
+          <>
+            <View style={[styles.pricingCardModern, pricingCardBandStyle]}>
+              <View style={styles.pricingCardModernHeader}>
                 <View
-                  key={r.id}
                   style={[
-                    styles.tableRow,
-                    { width: tableWidth },
-                    r.isScholar && styles.scholarRow,
+                    styles.pricingCardIconWrap,
+                    isScholarMode ? styles.pricingCardIconWrapScholar : styles.pricingCardIconWrapRegular,
                   ]}
                 >
-                  <Cell text={String(i + 1)} width={COL.sr} styles={styles} />
-                  <View style={[styles.cell, { width: COL.plot, flexDirection: 'row', gap: 3 }]}>  
-                    <Text style={styles.cellText}>{String(r.plotNumber)}</Text>
-                    {r.isScholar && <Icon name="auto-stories" size={13} color="#059669" />}
-                  </View>
-                  <Cell text={String(r.status || '-')} width={COL.status} styles={styles} />
-                  <Cell
-                    text={
-                      r.areaSqFt != null && !Number.isNaN(Number(r.areaSqFt))
-                        ? `${Number(r.areaSqFt).toLocaleString()}`
-                        : '—'
-                    }
-                    width={COL.area}
-                    styles={styles}
-                  />
-                  <Cell text={formatRupee(r.totalPlotCost)} width={COL.totalCost} styles={styles} />
-                  <Cell text={formatRupee(r.advance)} width={COL.advance} styles={styles} />
-                  <Cell text={formatRupee(r.emiAmount)} width={COL.emi} styles={styles} />
-                  <Cell text={formatRupee(r.cashOneTimePrice)} width={COL.cash} styles={styles} />
+                  <Icon name="calendar-view-month" size={26} color={pricingIconColor} />
                 </View>
-              ))}
+                <Text style={styles.pricingCardModernTitle}>EMI Plan (combined)</Text>
+              </View>
+              <PricingStatRow label="Total" amount={totals.totalPlotCost} styles={styles} />
+              <PricingStatRow label="Advance" amount={totals.advance} styles={styles} />
+              <PricingStatRow label="Balance for EMI" amount={balanceForEmi} styles={styles} />
+              <View style={styles.emiScheduleSection}>
+                <Text style={styles.emiScheduleSectionLabel}>EMI schedule (combined)</Text>
+                <View
+                  style={[
+                    styles.detailsEmiOuterBox,
+                    isScholarMode ? styles.detailsEmiOuterBoxScholar : styles.detailsEmiOuterBoxRegular,
+                  ]}
+                >
+                  <PlotDetailsEmiSchedule
+                    emi={combinedEmiSchedule.sumEmi}
+                    lastEmi={combinedEmiSchedule.allEqual36 ? null : combinedEmiSchedule.sumMonth36}
+                    styles={styles}
+                    isScholar={isScholarMode}
+                  />
+                </View>
+              </View>
+              <PricingStatTextRow label="Installments" value={EMI_INSTALLMENTS_LABEL} styles={styles} isLast />
             </View>
-          </ScrollView>
-        </View>
+
+            <View style={[styles.pricingCardModern, pricingCardBandStyle, styles.pricingCardModernSpacing]}>
+              <View style={styles.pricingCardModernHeader}>
+                <View
+                  style={[
+                    styles.pricingCardIconWrap,
+                    isScholarMode ? styles.pricingCardIconWrapScholar : styles.pricingCardIconWrapRegular,
+                  ]}
+                >
+                  <Icon name="payments" size={26} color={pricingIconColor} />
+                </View>
+                <Text style={styles.pricingCardModernTitle}>One-time Cash (combined)</Text>
+              </View>
+              <PricingStatRow label="Cash rate" amount={totals.cashOneTimePrice} styles={styles} />
+              <PricingStatRow label="Discount" amount={totals.cashDiscount} styles={styles} isLast />
+            </View>
+
+            <Text style={styles.sectionTitle}>Per-plot breakdown</Text>
+
+            <View style={[styles.tableOuter, { borderColor: colors.border, backgroundColor: colors.surface }]}>
+              <ScrollView
+                horizontal
+                showsHorizontalScrollIndicator
+                nestedScrollEnabled
+                bounces
+                directionalLockEnabled={Platform.OS === 'ios'}
+                style={styles.tableHorizontalScroll}
+                contentContainerStyle={styles.tableHorizontalContent}
+              >
+                <View style={{ width: tableWidth }}>
+                  <View style={[styles.tableRow, styles.tableHeader, { width: tableWidth }]}>
+                    <Cell text="Sr" width={COL.sr} header styles={styles} />
+                    <Cell text="Plot No." width={COL.plot} header styles={styles} />
+                    <Cell text="Status" width={COL.status} header styles={styles} />
+                    <Cell text="Area" width={COL.area} header styles={styles} />
+                    <Cell text="Total Cost" width={COL.totalCost} header styles={styles} />
+                    <Cell text="Advance" width={COL.advance} header styles={styles} />
+                    <Cell text={'Balance\nfor EMI'} width={COL.balance} header styles={styles} />
+                    <Cell text="EMI" width={COL.emi} header styles={styles} />
+                    <Cell text="Cash Rate" width={COL.cash} header styles={styles} />
+                  </View>
+                  {tableRows.map((r, i) => (
+                    <View
+                      key={r.id}
+                      style={[
+                        styles.tableRow,
+                        { width: tableWidth },
+                        r.isScholar && styles.scholarRow,
+                      ]}
+                    >
+                      <Cell text={String(i + 1)} width={COL.sr} styles={styles} />
+                      <View style={[styles.cell, styles.cellPlotInner, { width: COL.plot }]}>
+                        <Text style={styles.cellText}>{String(r.plotNumber)}</Text>
+                        {r.isScholar ? (
+                          <Icon name="auto-stories" size={13} color={isDark ? '#6ee7b7' : '#047857'} />
+                        ) : null}
+                      </View>
+                      <Cell
+                        text={STATUS_LABELS[r.status] || r.status || '—'}
+                        width={COL.status}
+                        styles={styles}
+                      />
+                      <Cell
+                        text={
+                          r.areaSqFt != null && !Number.isNaN(Number(r.areaSqFt))
+                            ? `${Number(r.areaSqFt).toLocaleString('en-IN')}`
+                            : '—'
+                        }
+                        width={COL.area}
+                        styles={styles}
+                      />
+                      <Cell text={fmtRsInr(r.totalPlotCost)} width={COL.totalCost} styles={styles} />
+                      <Cell text={fmtRsInr(r.advance)} width={COL.advance} styles={styles} />
+                      <Cell text={fmtRsInr(r.balanceForEmiRow)} width={COL.balance} styles={styles} />
+                      <MultiPlotEmiCell
+                        emi={r.emiAmount}
+                        lastEmi={r.lastEmiAmount}
+                        width={COL.emi}
+                        styles={styles}
+                        colors={colors}
+                      />
+                      <Cell text={fmtRsInr(r.cashOneTimePrice)} width={COL.cash} styles={styles} />
+                    </View>
+                  ))}
+                </View>
+              </ScrollView>
+            </View>
+          </>
+        )}
+
+        <View style={styles.scrollEndSpacer} />
       </ScrollView>
 
       <Modal visible={showPicker} transparent animationType="fade" onRequestClose={() => setShowPicker(false)}>
@@ -335,10 +547,10 @@ const MultiPlotSummaryScreen = () => {
                         Plot No. {p.plotNumber}
                       </Text>
                       <Text style={styles.pickerArea}>
-                        {p.areaSqFt ? `${Number(p.areaSqFt).toLocaleString()} sq ft` : '—'}
+                        {p.areaSqFt ? `${Number(p.areaSqFt).toLocaleString('en-IN')} sq ft` : '—'}
                       </Text>
                     </View>
-                    {isActive && <Icon name="check-circle" size={24} color="#059669" />}
+                    {isActive ? <Icon name="check-circle" size={24} color="#059669" /> : null}
                   </TouchableOpacity>
                 );
               })}
@@ -353,85 +565,86 @@ const MultiPlotSummaryScreen = () => {
   );
 };
 
-function SummaryTile({ label, value, styles }) {
-  return (
-    <View style={styles.tile}>
-      <Text style={styles.tileLabel}>{label}</Text>
-      <Text style={styles.tileValue}>{value}</Text>
-    </View>
-  );
-}
-
 function Cell({ text, width, header = false, styles }) {
   return (
     <View style={[styles.cell, { width }]}>
-      <Text style={header ? styles.cellTextHeader : styles.cellText}>{text}</Text>
+      <Text style={header ? styles.cellTextHeader : styles.cellText} numberOfLines={header ? 3 : 4}>
+        {text}
+      </Text>
     </View>
   );
 }
 
-const getStyles = (colors, isDark) =>
-  StyleSheet.create({
-    screen: { flex: 1, backgroundColor: colors.background },
-    center: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: colors.background },
-    scrollContent: { padding: 16, paddingBottom: 24 },
-    headRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 },
-    title: { fontSize: 22, fontWeight: '900', color: colors.text },
-    countPill: {
-      minWidth: 36,
-      height: 30,
-      borderRadius: 15,
-      backgroundColor: '#f59e0b',
-      justifyContent: 'center',
-      alignItems: 'center',
-      paddingHorizontal: 10,
-    },
-    countPillText: { color: '#0f172a', fontWeight: '900', fontSize: 14 },
-    toggleRow: { flexDirection: 'row', gap: 8, marginBottom: 10 },
-    toggleBtn: {
-      flex: 1,
-      borderRadius: 12,
-      minHeight: 40,
-      justifyContent: 'center',
-      alignItems: 'center',
-      borderWidth: 1.5,
-      paddingHorizontal: 8,
-    },
-    toggleBtnInactive: {
-      backgroundColor: isDark ? '#111827' : '#f8fafc',
-      borderColor: isDark ? '#374151' : '#cbd5e1',
-    },
-    toggleBtnActiveRegular: {
-      backgroundColor: '#facc15',
-      borderColor: '#ca8a04',
-      borderWidth: 2,
-    },
-    toggleBtnActiveScholar: {
-      backgroundColor: '#34d399',
-      borderColor: '#059669',
-      borderWidth: 2,
-    },
-    toggleText: { color: colors.textSecondary, fontWeight: '800', fontSize: 12, textAlign: 'center' },
-    toggleTextActive: { color: '#0f172a', fontWeight: '900' },
+function MultiPlotEmiCell({ emi, lastEmi, width, styles, colors }) {
+  if (emi == null || Number.isNaN(Number(emi))) {
+    return (
+      <View style={[styles.cell, styles.tableEmiCell, { width }]}>
+        <Text style={[styles.cellEmiLine, { color: colors.text }]}>—</Text>
+      </View>
+    );
+  }
+  const hasSplit = lastEmi != null && Number.isFinite(Number(lastEmi));
+  return (
+    <View style={[styles.cell, styles.tableEmiCell, { width }]}>
+      <View style={styles.cellEmiStack}>
+        {hasSplit ? (
+          <>
+            <View style={styles.cellEmiAmtRow}>
+              <EmiRupeeText style={[styles.cellEmiAmt, styles.cellEmiRupeeInRow]}>{fmtRsInr(emi)}</EmiRupeeText>
+              <Text style={styles.cellEmiMult}>×35</Text>
+            </View>
+            <Text style={[styles.cellEmiTablePlus, { color: colors.textSecondary }]}>+</Text>
+            <View style={styles.cellEmiAmtRow}>
+              <EmiRupeeText style={[styles.cellEmiAmt, styles.cellEmiRupeeInRow]}>
+                {fmtRsInr(lastEmi)}
+              </EmiRupeeText>
+              <Text style={styles.cellEmiMult}>×1</Text>
+            </View>
+          </>
+        ) : (
+          <View style={styles.cellEmiAmtRow}>
+            <EmiRupeeText style={[styles.cellEmiAmt, styles.cellEmiRupeeInRow]}>{fmtRsInr(emi)}</EmiRupeeText>
+            <Text style={styles.cellEmiMult}>×36</Text>
+          </View>
+        )}
+      </View>
+    </View>
+  );
+}
 
-    // ── Scholar banner ──
+function getExtraStyles(colors, isDark) {
+  return StyleSheet.create({
+    screenRoot: { flex: 1 },
+    center: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: colors.background },
+    summaryCardPlotNumbersWrap: {
+      minWidth: 0,
+      flex: 1,
+    },
+    summaryCardValuePlotNumbers: {
+      marginTop: 4,
+      minWidth: 0,
+      alignSelf: 'stretch',
+      fontSize: 22,
+      lineHeight: 26,
+      fontWeight: '900',
+      textAlign: 'center',
+      color: isDark ? '#fef3c7' : '#78350f',
+    },
     scholarBanner: {
       flexDirection: 'row',
       alignItems: 'center',
       backgroundColor: isDark ? '#052e16' : '#ecfdf5',
       borderWidth: 1.5,
-      borderColor: isDark ? '#059669' : '#a7f3d0',
       borderRadius: 12,
       paddingVertical: 10,
       paddingHorizontal: 12,
-      marginBottom: 10,
+      marginTop: 8,
       gap: 8,
     },
     scholarBannerText: {
       flex: 1,
       fontSize: 13,
       fontWeight: '700',
-      color: isDark ? '#a7f3d0' : '#065f46',
     },
     scholarChangeBtn: {
       paddingHorizontal: 12,
@@ -444,30 +657,39 @@ const getStyles = (colors, isDark) =>
       fontWeight: '800',
       color: isDark ? '#ecfdf5' : '#047857',
     },
-
-    summaryGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 12 },
-    tile: {
-      width: '48%',
-      backgroundColor: colors.surface,
+    emptyCard: {
+      borderRadius: 16,
       borderWidth: 1,
-      borderColor: colors.border,
-      borderRadius: 12,
-      padding: 10,
+      padding: 20,
+      alignItems: 'center',
     },
-    tileLabel: { fontSize: 12, fontWeight: '700', color: colors.textSecondary },
-    tileValue: { marginTop: 5, fontSize: 14, fontWeight: '900', color: colors.text },
+    emptyCardText: {
+      fontSize: 15,
+      fontWeight: '600',
+      textAlign: 'center',
+    },
     tableOuter: {
-      backgroundColor: colors.surface,
-      borderWidth: 1,
-      borderRadius: 12,
+      borderWidth: 2,
+      borderRadius: 18,
+      overflow: 'hidden',
+      ...Platform.select({
+        ios: {
+          shadowColor: '#000',
+          shadowOffset: { width: 0, height: 2 },
+          shadowOpacity: isDark ? 0.35 : 0.1,
+          shadowRadius: 8,
+        },
+        android: { elevation: 3 },
+      }),
     },
     tableHorizontalScroll: {},
     tableHorizontalContent: { flexGrow: 0 },
     tableRow: {
       flexDirection: 'row',
+      alignItems: 'stretch',
       borderBottomWidth: StyleSheet.hairlineWidth,
       borderBottomColor: isDark ? '#334155' : '#e2e8f0',
-      minHeight: 42,
+      minHeight: 78,
     },
     tableHeader: {
       backgroundColor: isDark ? '#312e81' : '#1e3a8a',
@@ -475,7 +697,7 @@ const getStyles = (colors, isDark) =>
       borderBottomColor: isDark ? '#6366f1' : '#3b82f6',
     },
     scholarRow: {
-      backgroundColor: isDark ? '#052e16' : '#f0fdf4',
+      backgroundColor: isDark ? 'rgba(52,211,153,0.12)' : '#f0fdf4',
     },
     cell: {
       justifyContent: 'center',
@@ -483,16 +705,78 @@ const getStyles = (colors, isDark) =>
       paddingHorizontal: 6,
       paddingVertical: 8,
     },
+    cellPlotInner: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 3,
+    },
+    tableEmiCell: {
+      paddingHorizontal: 2,
+      justifyContent: 'center',
+    },
+    cellEmiStack: {
+      width: '100%',
+      alignItems: 'center',
+      justifyContent: 'center',
+      gap: 2,
+    },
+    cellEmiAmtRow: {
+      flexDirection: 'row',
+      flexWrap: 'wrap',
+      justifyContent: 'center',
+      alignItems: 'center',
+      alignContent: 'center',
+      width: '100%',
+      gap: 4,
+    },
+    cellEmiRupeeInRow: {
+      flexShrink: 1,
+      minWidth: 0,
+      textAlign: 'center',
+    },
+    cellEmiAmt: {
+      fontSize: 12,
+      lineHeight: 16,
+      fontWeight: '800',
+      color: colors.text,
+      textAlign: 'center',
+    },
+    cellEmiMult: {
+      fontSize: 12,
+      lineHeight: 16,
+      fontWeight: '900',
+      color: colors.textSecondary,
+      flexShrink: 0,
+    },
+    cellEmiTablePlus: {
+      width: '100%',
+      textAlign: 'center',
+      fontSize: 15,
+      fontWeight: '900',
+      lineHeight: 17,
+      paddingVertical: 0,
+    },
+    cellEmiLine: {
+      fontSize: 13,
+      lineHeight: 17,
+      fontWeight: '800',
+      textAlign: 'center',
+      width: '100%',
+    },
     cellTextHeader: {
       fontSize: 11,
       fontWeight: '800',
       color: '#f8fafc',
       textTransform: 'uppercase',
       letterSpacing: 0.3,
+      textAlign: 'center',
     },
-    cellText: { fontSize: 12, fontWeight: '700', color: colors.text, textAlign: 'center' },
-
-    // ── Plot picker modal ──
+    cellText: {
+      fontSize: 11,
+      fontWeight: '700',
+      color: colors.text,
+      textAlign: 'center',
+    },
     pickerOverlay: {
       flex: 1,
       backgroundColor: 'rgba(0,0,0,0.55)',
@@ -573,5 +857,6 @@ const getStyles = (colors, isDark) =>
       color: colors.textSecondary,
     },
   });
+}
 
 export default MultiPlotSummaryScreen;

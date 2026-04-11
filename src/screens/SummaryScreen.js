@@ -1,5 +1,5 @@
 import { useTheme } from '../context/ThemeContext';
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import {
   View,
   Text,
@@ -14,8 +14,9 @@ import {
   Pressable,
   Platform,
   KeyboardAvoidingView,
+  Linking,
 } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import Icon from 'react-native-vector-icons/MaterialIcons';
 import DateTimePicker from '@react-native-community/datetimepicker';
 import dayjs from 'dayjs';
@@ -26,6 +27,11 @@ import { formatDateTime, nameOnly } from '../utils/formatting';
 import { getStatusSwatchColor } from '../constants/statusColors';
 import { useAlert } from '../context/AlertContext';
 import UserAvatar from '../components/UserAvatar';
+import ActivityLogDetailPanels from '../components/ActivityLogDetailPanels';
+import {
+  getActivityHistoryDetailBlocks,
+  activityLogCustomerSearchBlob,
+} from '../utils/activityHistoryDetails';
 import { keyboardAvoidingBehavior } from '../utils/keyboardAvoiding';
 
 const SUMMARY_FETCH_LIMIT = 1500;
@@ -54,10 +60,15 @@ function sameLocalDay(iso, dayRef) {
   return dayjs(iso).format('YYYY-MM-DD') === dayjs(dayRef).format('YYYY-MM-DD');
 }
 
+const SCROLL_TOP_THRESHOLD = 320;
+
 const SummaryScreen = () => {
   const { colors, isDark } = useTheme();
+  const insets = useSafeAreaInsets();
   const styles = React.useMemo(() => getStyles(colors, isDark), [colors, isDark]);
   const { showAlert } = useAlert();
+  const listRef = useRef(null);
+  const [showScrollTop, setShowScrollTop] = useState(false);
   const [activities, setActivities] = useState([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -72,6 +83,25 @@ const SummaryScreen = () => {
 
   const [sortMode, setSortMode] = useState('newest');
   const [filterModalVisible, setFilterModalVisible] = useState(false);
+
+  const dialPhone = useCallback(
+    async (raw) => {
+      const normalized = String(raw || '').replace(/[^\d+]/g, '');
+      if (!normalized) {
+        showAlert('No number', 'No phone number to call.');
+        return;
+      }
+      const url = `tel:${normalized}`;
+      try {
+        const supported = await Linking.canOpenURL(url);
+        if (supported) await Linking.openURL(url);
+        else showAlert('Cannot open dialer', 'This device cannot place calls from the app.');
+      } catch (e) {
+        showAlert('Call failed', e?.message || 'Could not open the phone app.');
+      }
+    },
+    [showAlert]
+  );
 
   const fetchActivities = useCallback(
     async ({ silent = false } = {}) => {
@@ -108,6 +138,15 @@ const SummaryScreen = () => {
     setRefreshing(true);
     fetchActivities();
   };
+
+  const onListScroll = useCallback((e) => {
+    const y = e.nativeEvent.contentOffset.y;
+    setShowScrollTop(y > SCROLL_TOP_THRESHOLD);
+  }, []);
+
+  const scrollToTop = useCallback(() => {
+    listRef.current?.scrollToOffset({ offset: 0, animated: true });
+  }, []);
 
   const hasTextFilters =
     plotFilter.trim().length > 0 ||
@@ -159,12 +198,9 @@ const SummaryScreen = () => {
     const cDigits = normalizeDigits(customerFilter);
     if (c || cDigits.length >= 2) {
       list = list.filter((a) => {
-        const name = String(a.customerName || '').toLowerCase();
-        if (c && name.includes(c)) return true;
-        if (cDigits.length >= 2) {
-          const mob = normalizeDigits(a.customerMobile || '');
-          if (mob.includes(cDigits)) return true;
-        }
+        const blob = activityLogCustomerSearchBlob(a);
+        if (c && blob.includes(c)) return true;
+        if (cDigits.length >= 2 && normalizeDigits(blob).includes(cDigits)) return true;
         return false;
       });
     }
@@ -222,6 +258,7 @@ const SummaryScreen = () => {
 
   const renderItem = useCallback(
     ({ item }) => {
+      const detailBlocks = getActivityHistoryDetailBlocks(item);
       const swatchColor = getStatusSwatchColor(item.action, item.newStatus, item.waiterCount);
       const isVacant = item.action === 'Marked Vacant' || item.newStatus === 'vacant';
       const isRemoved = item.action === 'Removed Waiting' || item.action === 'Removed Waiter';
@@ -244,8 +281,8 @@ const SummaryScreen = () => {
               <Text style={styles.activityTitle}>{displayActivityAction(item.action, item.newStatus)}</Text>
               <Text style={styles.activityTime}>{formatDateTime(item.createdAt)}</Text>
             </View>
-            <Text style={styles.activityMetaPrimary}>Plot {item.plotNumber}</Text>
-            <Text style={styles.activityMetaSecondary}>Customer: {item.customerName || '-'}</Text>
+            <Text style={styles.activityMetaPrimary}>Plot No. {item.plotNumber}</Text>
+            <Text style={styles.activityCustomerLine}>Customer: {item.customerName || '-'}</Text>
             <View style={styles.activityByRow}>
               <UserAvatar
                 name={item.changedBy}
@@ -275,7 +312,16 @@ const SummaryScreen = () => {
                 ) : null}
               </View>
             ) : null}
-            {(item.action === 'Removed Waiting' || item.action === 'Removed Waiter') && item.removalRemarks ? (
+            <ActivityLogDetailPanels
+              blocks={detailBlocks}
+              colors={colors}
+              isDark={isDark}
+              dialPhone={dialPhone}
+              itemKey={String(item._id)}
+            />
+            {(item.action === 'Removed Waiting' || item.action === 'Removed Waiter') &&
+            item.removalRemarks &&
+            detailBlocks.length === 0 ? (
               <View style={styles.detailBlock}>
                 <Text style={styles.detailLine}>Removal reason: {item.removalRemarks}</Text>
               </View>
@@ -284,7 +330,7 @@ const SummaryScreen = () => {
         </View>
       );
     },
-    [styles, colors.text, colors.border]
+    [styles, colors, isDark, dialPhone]
   );
 
   const closeFilterModal = useCallback(() => {
@@ -377,11 +423,14 @@ const SummaryScreen = () => {
     <>
     <SafeAreaView style={styles.container} edges={['left', 'right']}>
       <FlatList
+        ref={listRef}
         data={filteredSorted}
         keyExtractor={(item) => String(item._id)}
         renderItem={renderItem}
         ListHeaderComponent={listHeader}
         contentContainerStyle={styles.listContainer}
+        onScroll={onListScroll}
+        scrollEventThrottle={16}
         refreshControl={
           <RefreshControl refreshing={refreshing} onRefresh={onRefresh} colors={[colors.primary]} />
         }
@@ -398,6 +447,25 @@ const SummaryScreen = () => {
           </View>
         }
       />
+
+      {showScrollTop && filteredSorted.length > 0 ? (
+        <TouchableOpacity
+          style={[
+            styles.scrollTopFab,
+            {
+              backgroundColor: colors.primary,
+              bottom: 20 + Math.max(insets.bottom, 8),
+              shadowColor: '#000',
+            },
+          ]}
+          onPress={scrollToTop}
+          activeOpacity={0.9}
+          accessibilityRole="button"
+          accessibilityLabel="Scroll to top"
+        >
+          <Icon name="keyboard-arrow-up" size={30} color="#fff" />
+        </TouchableOpacity>
+      ) : null}
 
       <Modal
         visible={filterModalVisible}
@@ -568,6 +636,21 @@ const getStyles = (colors, isDark) =>
     container: {
       flex: 1,
       backgroundColor: colors.background,
+      position: 'relative',
+    },
+    scrollTopFab: {
+      position: 'absolute',
+      right: 18,
+      width: 52,
+      height: 52,
+      borderRadius: 26,
+      alignItems: 'center',
+      justifyContent: 'center',
+      zIndex: 20,
+      elevation: 6,
+      shadowOffset: { width: 0, height: 3 },
+      shadowOpacity: 0.28,
+      shadowRadius: 4,
     },
     listContainer: {
       paddingHorizontal: 16,
@@ -749,6 +832,13 @@ const getStyles = (colors, isDark) =>
       fontWeight: '800',
       color: colors.primary,
       marginTop: 2,
+    },
+    activityCustomerLine: {
+      fontSize: 16,
+      fontWeight: '700',
+      color: colors.text,
+      marginTop: 4,
+      lineHeight: 22,
     },
     activityMetaSecondary: {
       fontSize: 13,

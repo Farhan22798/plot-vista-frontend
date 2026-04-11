@@ -24,9 +24,9 @@ import Orientation from 'react-native-orientation-locker';
 
 const COL_PLOT = 52;
 const COL_AREA = 80;
-const COL_NUM = 140;
-const COL_ADV = 115;
-const COL_EMI = 110;
+const COL_NUM = 168;
+const COL_ADV = 122;
+const COL_EMI = 132;
 const COL_SCHOLAR = 46;
 const ROW_WIDTH = COL_PLOT + COL_AREA + COL_NUM + COL_ADV + COL_NUM + COL_EMI + COL_NUM + COL_SCHOLAR;
 
@@ -49,9 +49,74 @@ function computePricing(areaSqFt) {
   const schCash = Math.round(areaSqFt * SCHOLAR_CASH_RATE);
 
   return {
-    regular: { total: regTotal, advance: regAdv, balance: regTotal - regAdv, emi: regEmi, cash: regCash },
-    scholar: { total: schTotal, advance: schAdv, balance: schTotal - schAdv, emi: schEmi, cash: schCash },
+    regular: {
+      total: regTotal,
+      advance: regAdv,
+      balance: regTotal - regAdv,
+      emi: regEmi,
+      lastEmi: null,
+      cash: regCash,
+    },
+    scholar: {
+      total: schTotal,
+      advance: schAdv,
+      balance: schTotal - schAdv,
+      emi: schEmi,
+      lastEmi: null,
+      cash: schCash,
+    },
   };
+}
+
+/** Prefer Mongo-backed pricing (plot details / seed); fall back to area formula. */
+function pricingFromServerPlot(item) {
+  const reg = item.categoryPricing?.regular;
+  if (reg == null || reg.totalPlotCost == null) return null;
+  const total = Number(reg.totalPlotCost);
+  const advance = Number(reg.advance);
+  if (!Number.isFinite(total) || !Number.isFinite(advance)) return null;
+  const balance = total - advance;
+  const emi = Number(reg.emiAmount);
+  const lastEmi =
+    reg.lastEmiAmount != null && !Number.isNaN(Number(reg.lastEmiAmount))
+      ? Number(reg.lastEmiAmount)
+      : null;
+  const cash = Number(reg.cashOneTimePrice);
+  const sch = item.categoryPricing?.scholar;
+  let scholar = null;
+  if (sch && sch.totalPlotCost != null) {
+    const st = Number(sch.totalPlotCost);
+    const sa = Number(sch.advance);
+    if (Number.isFinite(st) && Number.isFinite(sa)) {
+      scholar = {
+        total: st,
+        advance: sa,
+        balance: st - sa,
+        emi: Number(sch.emiAmount),
+        lastEmi:
+          sch.lastEmiAmount != null && !Number.isNaN(Number(sch.lastEmiAmount))
+            ? Number(sch.lastEmiAmount)
+            : null,
+        cash: Number(sch.cashOneTimePrice),
+      };
+    }
+  }
+  const out = {
+    regular: {
+      total,
+      advance,
+      balance,
+      emi,
+      lastEmi,
+      cash,
+    },
+    scholar,
+  };
+  if (!out.scholar && item.areaSqFt) {
+    const fb = computePricing(item.areaSqFt);
+    if (fb) out.scholar = fb.scholar;
+  }
+  return out;
 }
 
 function fmt(n) {
@@ -59,9 +124,66 @@ function fmt(n) {
   return Number(n).toLocaleString('en-IN');
 }
 
+/**
+ * Thin space + word joiner so `/-` stays attached to digits in layout engines
+ * that ignore adjustsFontSizeToFit.
+ */
 function fmtRs(n) {
   if (n == null) return '—';
-  return `₹${Number(n).toLocaleString('en-IN')}/-`;
+  return `₹${Number(n).toLocaleString('en-IN')}\u202F/\u2060-`;
+}
+
+/** Single-line rupee: shrinks font if needed so `₹…/-` does not break. */
+function RupeeText({ style, children, ...rest }) {
+  return (
+    <Text
+      style={style}
+      numberOfLines={1}
+      adjustsFontSizeToFit
+      minimumFontScale={0.62}
+      maxFontSizeMultiplier={1.2}
+      {...rest}
+    >
+      {children}
+    </Text>
+  );
+}
+
+/** Scholar modal: EMI as bordered lines — amount and ×N clearly separated. */
+function ScholarModalEmiColumn({ band, isScholar, styles }) {
+  const amountStyle = [
+    styles.compareCellAmount,
+    isScholar ? styles.compareScholar : null,
+  ];
+  const pillTextStyle = [
+    styles.modalEmiSuffixPillText,
+    isScholar ? styles.compareScholar : null,
+  ];
+  if (!band || band.emi == null) {
+    return <RupeeText style={amountStyle}>—</RupeeText>;
+  }
+  const Line = ({ amount, suffix, isLast }) => (
+    <View style={[styles.modalEmiLineBox, isLast ? styles.modalEmiLineBoxLast : null]}>
+      <RupeeText style={[amountStyle, styles.modalEmiAmountBlock]}>{fmtRs(amount)}</RupeeText>
+      <View style={[styles.modalEmiSuffixPill, isScholar ? styles.modalEmiSuffixPillScholar : null]}>
+        <Text style={pillTextStyle}>{suffix}</Text>
+      </View>
+    </View>
+  );
+  if (band.lastEmi != null) {
+    return (
+      <View style={styles.modalEmiColInner}>
+        <Line amount={band.emi} suffix="×35" />
+        <Text style={[styles.modalEmiPlus, isScholar ? styles.compareScholar : null]}>+</Text>
+        <Line amount={band.lastEmi} suffix="×1" isLast />
+      </View>
+    );
+  }
+  return (
+    <View style={styles.modalEmiColInner}>
+      <Line amount={band.emi} suffix="×36" isLast />
+    </View>
+  );
 }
 
 const AreaStatementScreen = () => {
@@ -112,6 +234,25 @@ const AreaStatementScreen = () => {
     []
   );
 
+  const manualFullscreenRef = useRef(false);
+
+  const [plots, setPlots] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [scholarPlot, setScholarPlot] = useState(null);
+  const [selectedId, setSelectedId] = useState(null);
+  /** One-tap: table shows only vacant (OPEN) plots. */
+  const [openPlotsOnly, setOpenPlotsOnly] = useState(false);
+
+  const openPlotCount = useMemo(
+    () => plots.filter((p) => p.status === 'vacant').length,
+    [plots],
+  );
+
+  const tablePlots = useMemo(
+    () => (openPlotsOnly ? plots.filter((p) => p.status === 'vacant') : plots),
+    [plots, openPlotsOnly],
+  );
+
   const enterFullscreen = useCallback(() => {
     manualFullscreenRef.current = true;
     Orientation.lockToLandscapeLeft();
@@ -127,6 +268,10 @@ const AreaStatementScreen = () => {
     Orientation.lockToLandscapeLeft();
   }, [isLandscape]);
 
+  const toggleOpenPlotsOnly = useCallback(() => {
+    setOpenPlotsOnly((v) => !v);
+  }, []);
+
   const applyAreaStatementChrome = useCallback(() => {
     if (!navigation.isFocused()) return;
     if (isLandscapeRef.current) {
@@ -140,29 +285,81 @@ const AreaStatementScreen = () => {
         tabBarStyle: defaultTabBarStyle,
         headerShown: true,
         headerRight: () => (
-          <TouchableOpacity
-            style={styles.headerFullscreenBtn}
-            onPress={enterFullscreen}
-            activeOpacity={0.85}
-            accessibilityRole="button"
-            accessibilityLabel="Enter fullscreen"
-          >
-            <Icon name="fullscreen" size={20} color={colors.primary} />
-          </TouchableOpacity>
+          <View style={styles.headerActionsRow}>
+            <TouchableOpacity
+              style={[
+                styles.openFilterChipHeader,
+                { borderColor: colors.border, backgroundColor: colors.surface },
+                openPlotsOnly && [
+                  styles.openFilterChipHeaderActive,
+                  { borderColor: colors.primary },
+                ],
+              ]}
+              onPress={toggleOpenPlotsOnly}
+              activeOpacity={0.88}
+              accessibilityRole="button"
+              accessibilityState={{ selected: openPlotsOnly }}
+              accessibilityLabel={
+                openPlotsOnly
+                  ? `Showing open plots only, ${tablePlots.length} plots. Tap to show all.`
+                  : `Show open plots only. ${openPlotCount} open of ${plots.length} total.`
+              }
+            >
+              <Icon
+                name={openPlotsOnly ? 'filter-alt' : 'filter-alt-off'}
+                size={17}
+                color={openPlotsOnly ? colors.primary : colors.textSecondary}
+              />
+              <Text
+                style={[
+                  styles.openFilterChipHeaderText,
+                  { color: openPlotsOnly ? colors.primary : colors.text },
+                ]}
+                numberOfLines={1}
+              >
+                {openPlotsOnly
+                  ? `Open · ${tablePlots.length}`
+                  : `Open (${openPlotCount})`}
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.headerFullscreenBtn}
+              onPress={enterFullscreen}
+              activeOpacity={0.85}
+              accessibilityRole="button"
+              accessibilityLabel="Enter fullscreen"
+            >
+              <Icon name="fullscreen" size={20} color={colors.primary} />
+            </TouchableOpacity>
+          </View>
         ),
       });
     }
-  }, [navigation, defaultTabBarStyle, tabBarHiddenStyle, styles.headerFullscreenBtn, enterFullscreen, colors.primary]);
+  }, [
+    navigation,
+    defaultTabBarStyle,
+    tabBarHiddenStyle,
+    styles.headerActionsRow,
+    styles.headerFullscreenBtn,
+    styles.openFilterChipHeader,
+    styles.openFilterChipHeaderActive,
+    styles.openFilterChipHeaderText,
+    enterFullscreen,
+    toggleOpenPlotsOnly,
+    colors.primary,
+    colors.border,
+    colors.surface,
+    colors.text,
+    colors.textSecondary,
+    openPlotsOnly,
+    openPlotCount,
+    tablePlots.length,
+    plots.length,
+  ]);
 
   useLayoutEffect(() => {
     applyAreaStatementChrome();
   }, [isLandscape, applyAreaStatementChrome]);
-
-  const [plots, setPlots] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [scholarPlot, setScholarPlot] = useState(null);
-  const [selectedId, setSelectedId] = useState(null);
-  const manualFullscreenRef = useRef(false);
 
   const fetchPlots = useCallback(async (silent = false) => {
     try {
@@ -234,8 +431,14 @@ const AreaStatementScreen = () => {
   }, []);
 
   const renderRow = ({ item, index }) => {
-    const area = item.areaSqFt || item.categoryPricing?.regular?.totalPlotCost / REGULAR_EMI_RATE;
-    const pricing = computePricing(area);
+    const fromServer = pricingFromServerPlot(item);
+    const area =
+      item.areaSqFt != null
+        ? item.areaSqFt
+        : item.categoryPricing?.regular?.totalPlotCost != null
+          ? item.categoryPricing.regular.totalPlotCost / REGULAR_EMI_RATE
+          : null;
+    const pricing = fromServer || (area != null ? computePricing(area) : null);
     if (!pricing) return null;
     const r = pricing.regular;
     const isEven = index % 2 === 0;
@@ -252,25 +455,46 @@ const AreaStatementScreen = () => {
         ]}
       >
         <View style={[styles.gridCell, styles.cellPlotW]}>
-          <Text style={[styles.cell, styles.cellPlotTxt]} numberOfLines={1}>{item.plotNumber}</Text>
+          <Text style={[styles.cell, styles.cellPlotTxt]}>{item.plotNumber}</Text>
         </View>
         <View style={[styles.gridCell, styles.cellAreaW]}>
-          <Text style={[styles.cell, styles.cellAreaTxt]} numberOfLines={1}>{fmt(area)}</Text>
+          <Text style={[styles.cell, styles.cellAreaTxt]}>{fmt(area)}</Text>
         </View>
         <View style={[styles.gridCell, styles.cellNumW]}>
-          <Text style={[styles.cell, styles.cellNumTxt]} numberOfLines={1}>{fmtRs(r.total)}</Text>
+          <RupeeText style={[styles.cell, styles.cellNumTxt, styles.cellMoneyText]}>{fmtRs(r.total)}</RupeeText>
         </View>
         <View style={[styles.gridCell, styles.cellAdvW]}>
-          <Text style={[styles.cell, styles.cellNumTxt]} numberOfLines={1}>{fmtRs(r.advance)}</Text>
+          <RupeeText style={[styles.cell, styles.cellNumTxt, styles.cellMoneyText]}>{fmtRs(r.advance)}</RupeeText>
         </View>
         <View style={[styles.gridCell, styles.cellNumW]}>
-          <Text style={[styles.cell, styles.cellNumTxt]} numberOfLines={1}>{fmtRs(r.balance)}</Text>
+          <RupeeText style={[styles.cell, styles.cellNumTxt, styles.cellMoneyText]}>{fmtRs(r.balance)}</RupeeText>
         </View>
         <View style={[styles.gridCell, styles.cellEmiW]}>
-          <Text style={[styles.cell, styles.cellNumTxt]} numberOfLines={1}>{fmtRs(r.emi)}</Text>
+          <View style={styles.cellEmiStack}>
+            {r.emi == null ? (
+              <Text style={styles.cellEmiLine}>—</Text>
+            ) : r.lastEmi != null ? (
+              <>
+                <View style={styles.cellEmiAmtRow}>
+                  <RupeeText style={[styles.cellEmiAmt, styles.cellEmiRupeeInRow]}>{fmtRs(r.emi)}</RupeeText>
+                  <Text style={styles.cellEmiMult}>×35</Text>
+                </View>
+                <Text style={styles.cellEmiTablePlus}>+</Text>
+                <View style={styles.cellEmiAmtRow}>
+                  <RupeeText style={[styles.cellEmiAmt, styles.cellEmiRupeeInRow]}>{fmtRs(r.lastEmi)}</RupeeText>
+                  <Text style={styles.cellEmiMult}>×1</Text>
+                </View>
+              </>
+            ) : (
+              <View style={styles.cellEmiAmtRow}>
+                <RupeeText style={[styles.cellEmiAmt, styles.cellEmiRupeeInRow]}>{fmtRs(r.emi)}</RupeeText>
+                <Text style={styles.cellEmiMult}>×36</Text>
+              </View>
+            )}
+          </View>
         </View>
         <View style={[styles.gridCell, styles.cellNumW, styles.gridCellLast]}>
-          <Text style={[styles.cell, styles.cellNumTxt]} numberOfLines={1}>{fmtRs(r.cash)}</Text>
+          <RupeeText style={[styles.cell, styles.cellNumTxt, styles.cellMoneyText]}>{fmtRs(r.cash)}</RupeeText>
         </View>
         <TouchableOpacity
           style={styles.scholarBtn}
@@ -288,7 +512,7 @@ const AreaStatementScreen = () => {
         <Text style={styles.headerCell}>{'Plot\nNo.'}</Text>
       </View>
       <View style={[styles.headerGridCell, styles.cellAreaW]}>
-        <Text style={styles.headerCell}>{'Area\n(in Sq. Ft.)'}</Text>
+        <Text style={styles.headerCell}>{'AREA\n(in Sq. Ft.)'}</Text>
       </View>
       <View style={[styles.headerGridCell, styles.cellNumW]}>
         <Text style={styles.headerCell}>Price</Text>
@@ -327,17 +551,25 @@ const AreaStatementScreen = () => {
       >
         {header}
         <FlatList
-          data={plots}
+          data={tablePlots}
           keyExtractor={(item) => item._id || item.plotNumber}
           renderItem={renderRow}
-          extraData={selectedId}
+          extraData={`${selectedId}-${openPlotsOnly}-${tablePlots.length}`}
           nestedScrollEnabled
           initialNumToRender={30}
           maxToRenderPerBatch={40}
           windowSize={10}
           style={compact ? styles.flatListFill : undefined}
           contentContainerStyle={compact ? styles.flatListContentLandscape : undefined}
-          getItemLayout={(_, index) => ({ length: 48, offset: 48 * index, index })}
+          ListEmptyComponent={
+            openPlotsOnly ? (
+              <View style={styles.tableEmptyHint}>
+                <Text style={[styles.tableEmptyHintText, { color: colors.textSecondary }]}>
+                  No open plots right now.
+                </Text>
+              </View>
+            ) : null
+          }
         />
       </View>
     </ScrollView>
@@ -355,6 +587,42 @@ const AreaStatementScreen = () => {
           edges={['top', 'left', 'right', 'bottom']}
         >
           <View style={styles.landscapeActionBar}>
+            <TouchableOpacity
+              style={[
+                styles.openFilterChipLandscape,
+                { borderColor: colors.border, backgroundColor: colors.surface },
+                openPlotsOnly && [
+                  styles.openFilterChipLandscapeActive,
+                  { borderColor: colors.primary },
+                ],
+              ]}
+              onPress={toggleOpenPlotsOnly}
+              activeOpacity={0.88}
+              accessibilityRole="button"
+              accessibilityState={{ selected: openPlotsOnly }}
+              accessibilityLabel={
+                openPlotsOnly
+                  ? `Showing open plots only, ${tablePlots.length} plots. Tap to show all.`
+                  : `Show open plots only. ${openPlotCount} open of ${plots.length} total.`
+              }
+            >
+              <Icon
+                name={openPlotsOnly ? 'filter-alt' : 'filter-alt-off'}
+                size={17}
+                color={openPlotsOnly ? colors.primary : colors.textSecondary}
+              />
+              <Text
+                style={[
+                  styles.openFilterChipLandscapeText,
+                  { color: openPlotsOnly ? colors.primary : colors.text },
+                ]}
+                numberOfLines={1}
+              >
+                {openPlotsOnly
+                  ? `Open · ${tablePlots.length}`
+                  : `Open (${openPlotCount})`}
+              </Text>
+            </TouchableOpacity>
             <TouchableOpacity
               style={[styles.landscapeActionBtn, { backgroundColor: colors.surface, borderColor: colors.border }]}
               onPress={toggleFullscreen}
@@ -379,24 +647,54 @@ const AreaStatementScreen = () => {
         onRequestClose={() => setScholarPlot(null)}
       >
         <Pressable style={styles.modalOverlay} onPress={() => setScholarPlot(null)}>
-          <Pressable style={styles.modalSheet} onPress={(e) => e.stopPropagation()}>
+          <Pressable
+            style={[
+              styles.modalSheet,
+              {
+                maxHeight: Math.min(
+                  windowHeight - insets.top - insets.bottom - 20,
+                  680
+                ),
+              },
+            ]}
+            onPress={(e) => e.stopPropagation()}
+          >
+            <ScrollView
+              style={styles.modalScroll}
+              contentContainerStyle={styles.modalScrollContent}
+              showsVerticalScrollIndicator
+              bounces={false}
+              nestedScrollEnabled
+            >
             <View style={styles.modalHeader}>
               <Icon name="auto-stories" size={26} color="#7c3aed" />
               <Text style={styles.modalTitle}>Aalim / Hafiz Discount</Text>
             </View>
-            <Text style={styles.modalPlot}>
-              Plot No. {scholarPlot?.plotNumber} · {fmt(scholarPlot?.area)} sq ft
-            </Text>
+
+            <View style={styles.modalPlotHighlightRow}>
+              <View style={[styles.modalPlotBadge, styles.modalPlotBadgePlot]}>
+                <Text style={styles.modalPlotBadgeLabelPlot}>Plot number</Text>
+                <Text style={styles.modalPlotBadgeValuePlot} numberOfLines={1}>
+                  {scholarPlot?.plotNumber ?? '—'}
+                </Text>
+              </View>
+              <View style={[styles.modalPlotBadge, styles.modalPlotBadgeAreaCard]}>
+                <Text style={styles.modalPlotBadgeLabelArea}>AREA (in Sq. Ft.)</Text>
+                <Text style={styles.modalPlotBadgeValueArea} numberOfLines={1}>
+                  {scholarPlot?.area != null ? fmt(scholarPlot.area) : '—'}
+                </Text>
+              </View>
+            </View>
 
             <View style={styles.compareTable}>
               <View style={styles.compareHeaderRow}>
                 <View style={[styles.compareCellWrap, styles.compareLabelWrap]}>
                   <Text style={[styles.compareHeaderCell, styles.compareLabelTxt]} />
                 </View>
-                <View style={styles.compareCellWrap}>
+                <View style={[styles.compareCellWrap, styles.compareHeaderColBorder]}>
                   <Text style={styles.compareHeaderCell}>Regular</Text>
                 </View>
-                <View style={styles.compareCellWrap}>
+                <View style={[styles.compareCellWrap, styles.compareHeaderColBorder]}>
                   <Text style={[styles.compareHeaderCell, styles.compareScholar]}>Scholar</Text>
                 </View>
               </View>
@@ -405,32 +703,47 @@ const AreaStatementScreen = () => {
                 ['Total Price', scholarPlot?.pricing?.regular?.total, scholarData?.total],
                 ['Advance', scholarPlot?.pricing?.regular?.advance, scholarData?.advance],
                 ['Balance For EMI', scholarPlot?.pricing?.regular?.balance, scholarData?.balance],
-                [`EMI (${EMI_MONTHS}m)`, scholarPlot?.pricing?.regular?.emi, scholarData?.emi],
               ].map(([label, reg, sch]) => (
                 <View key={label} style={styles.compareRow}>
                   <View style={[styles.compareCellWrap, styles.compareLabelWrap]}>
                     <Text style={[styles.compareCell, styles.compareLabelTxt]}>{label}</Text>
                   </View>
-                  <View style={styles.compareCellWrap}>
-                    <Text style={styles.compareCell}>{fmtRs(reg)}</Text>
+                  <View style={[styles.compareCellWrap, styles.compareColBorder]}>
+                    <RupeeText style={styles.compareCellAmount}>{fmtRs(reg)}</RupeeText>
                   </View>
-                  <View style={styles.compareCellWrap}>
-                    <Text style={[styles.compareCell, styles.compareScholar]}>{fmtRs(sch)}</Text>
+                  <View style={[styles.compareCellWrap, styles.compareColBorder]}>
+                    <RupeeText style={[styles.compareCellAmount, styles.compareScholar]}>{fmtRs(sch)}</RupeeText>
                   </View>
                 </View>
               ))}
+
+              <View style={[styles.compareRow, styles.compareRowEmi]}>
+                <View style={[styles.compareCellWrap, styles.compareLabelWrap]}>
+                  <Text style={[styles.compareCell, styles.compareLabelTxt]}>EMI</Text>
+                </View>
+                <View style={[styles.compareCellWrap, styles.compareColBorder, styles.compareCellEmiPad]}>
+                  <View style={styles.modalEmiColumnBox}>
+                    <ScholarModalEmiColumn band={scholarPlot?.pricing?.regular} isScholar={false} styles={styles} />
+                  </View>
+                </View>
+                <View style={[styles.compareCellWrap, styles.compareColBorder, styles.compareCellEmiPad]}>
+                  <View style={[styles.modalEmiColumnBox, styles.modalEmiColumnBoxScholar]}>
+                    <ScholarModalEmiColumn band={scholarData} isScholar styles={styles} />
+                  </View>
+                </View>
+              </View>
 
               <View style={styles.savingsRow}>
                 <View style={[styles.compareCellWrap, styles.compareLabelWrap]}>
                   <Text style={[styles.savingsCell, styles.savingsLabel]}>You Save on EMI</Text>
                 </View>
-                <View style={styles.compareCellWrap}>
+                <View style={[styles.compareCellWrap, styles.compareColBorder]}>
                   <Text style={styles.savingsCell}>—</Text>
                 </View>
-                <View style={styles.compareCellWrap}>
-                  <Text style={[styles.savingsCell, styles.savingsValue]}>
+                <View style={[styles.compareCellWrap, styles.compareColBorder]}>
+                  <RupeeText style={[styles.compareCellAmount, styles.savingsValue]}>
                     {fmtRs((scholarPlot?.pricing?.regular?.total || 0) - (scholarData?.total || 0))}
-                  </Text>
+                  </RupeeText>
                 </View>
               </View>
 
@@ -440,11 +753,13 @@ const AreaStatementScreen = () => {
                 <View style={[styles.compareCellWrap, styles.compareLabelWrap]}>
                   <Text style={[styles.compareCell, styles.compareLabelTxt]}>Cash Price</Text>
                 </View>
-                <View style={styles.compareCellWrap}>
-                  <Text style={styles.compareCell}>{fmtRs(scholarPlot?.pricing?.regular?.cash)}</Text>
+                <View style={[styles.compareCellWrap, styles.compareColBorder]}>
+                  <RupeeText style={styles.compareCellAmount}>{fmtRs(scholarPlot?.pricing?.regular?.cash)}</RupeeText>
                 </View>
-                <View style={styles.compareCellWrap}>
-                  <Text style={[styles.compareCell, styles.compareScholar]}>{fmtRs(scholarData?.cash)}</Text>
+                <View style={[styles.compareCellWrap, styles.compareColBorder]}>
+                  <RupeeText style={[styles.compareCellAmount, styles.compareScholar]}>
+                    {fmtRs(scholarData?.cash)}
+                  </RupeeText>
                 </View>
               </View>
 
@@ -452,15 +767,15 @@ const AreaStatementScreen = () => {
                 <View style={[styles.compareCellWrap, styles.compareLabelWrap]}>
                   <Text style={[styles.savingsCell, styles.savingsLabel]}>You Save on Cash</Text>
                 </View>
-                <View style={styles.compareCellWrap}>
-                  <Text style={[styles.savingsCell, styles.savingsValue]}>
+                <View style={[styles.compareCellWrap, styles.compareColBorder]}>
+                  <RupeeText style={[styles.compareCellAmount, styles.savingsValue]}>
                     {fmtRs((scholarPlot?.pricing?.regular?.total || 0) - (scholarPlot?.pricing?.regular?.cash || 0))}
-                  </Text>
+                  </RupeeText>
                 </View>
-                <View style={styles.compareCellWrap}>
-                  <Text style={[styles.savingsCell, styles.savingsValue]}>
+                <View style={[styles.compareCellWrap, styles.compareColBorder]}>
+                  <RupeeText style={[styles.compareCellAmount, styles.savingsValue]}>
                     {fmtRs((scholarPlot?.pricing?.regular?.total || 0) - (scholarData?.cash || 0))}
-                  </Text>
+                  </RupeeText>
                 </View>
               </View>
             </View>
@@ -468,6 +783,7 @@ const AreaStatementScreen = () => {
             <TouchableOpacity style={styles.modalClose} onPress={() => setScholarPlot(null)}>
               <Text style={styles.modalCloseText}>Close</Text>
             </TouchableOpacity>
+            </ScrollView>
           </Pressable>
         </Pressable>
       </Modal>
@@ -483,6 +799,73 @@ function getStyles(colors, isDark) {
   return StyleSheet.create({
     container: { flex: 1, backgroundColor: colors.background },
     center: { flex: 1, justifyContent: 'center', alignItems: 'center' },
+
+    headerActionsRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 8,
+      marginRight: 2,
+      maxWidth: '88%',
+    },
+    openFilterChipHeader: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 6,
+      paddingVertical: 6,
+      paddingHorizontal: 10,
+      borderRadius: 10,
+      borderWidth: 1.5,
+      flexShrink: 1,
+      minHeight: 36,
+      maxWidth: 200,
+      ...Platform.select({
+        ios: {
+          shadowColor: '#000',
+          shadowOffset: { width: 0, height: 1 },
+          shadowOpacity: isDark ? 0.2 : 0.06,
+          shadowRadius: 2,
+        },
+        android: { elevation: 1 },
+      }),
+    },
+    openFilterChipHeaderActive: {
+      backgroundColor: isDark ? 'rgba(59,130,246,0.18)' : 'rgba(59,130,246,0.1)',
+    },
+    openFilterChipHeaderText: {
+      fontSize: 12,
+      fontWeight: '800',
+      flexShrink: 1,
+    },
+    openFilterChipLandscape: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 6,
+      minHeight: 34,
+      paddingHorizontal: 10,
+      paddingVertical: 6,
+      borderRadius: 10,
+      borderWidth: 1.5,
+      flexShrink: 1,
+      maxWidth: '48%',
+    },
+    openFilterChipLandscapeActive: {
+      backgroundColor: isDark ? 'rgba(59,130,246,0.18)' : 'rgba(59,130,246,0.1)',
+    },
+    openFilterChipLandscapeText: {
+      fontSize: 12,
+      fontWeight: '800',
+      flexShrink: 1,
+    },
+    tableEmptyHint: {
+      paddingVertical: 28,
+      paddingHorizontal: 16,
+      alignItems: 'center',
+    },
+    tableEmptyHintText: {
+      fontSize: 14,
+      fontWeight: '600',
+      textAlign: 'center',
+    },
 
     landscapeTableSafe: { flex: 1 },
     horizontalTableHost: { flex: 1 },
@@ -514,13 +897,16 @@ function getStyles(colors, isDark) {
       borderRadius: 10,
       alignItems: 'center',
       justifyContent: 'center',
-      marginRight: 4,
     },
     landscapeActionBar: {
       paddingHorizontal: 12,
       paddingTop: 6,
       paddingBottom: 6,
-      alignItems: 'flex-end',
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'flex-end',
+      flexWrap: 'nowrap',
+      gap: 8,
     },
     landscapeActionBtn: {
       minHeight: 34,
@@ -552,7 +938,7 @@ function getStyles(colors, isDark) {
       alignItems: 'stretch',
       backgroundColor: tableHeaderBg,
       width: ROW_WIDTH,
-      minHeight: 48,
+      minHeight: 78,
       borderBottomWidth: 2,
       borderBottomColor: isDark ? '#6366f1' : '#3b82f6',
     },
@@ -577,7 +963,7 @@ function getStyles(colors, isDark) {
     row: {
       flexDirection: 'row',
       alignItems: 'stretch',
-      height: 48,
+      minHeight: 78,
       width: ROW_WIDTH,
       borderBottomWidth: 1,
       borderBottomColor: borderColor,
@@ -617,12 +1003,68 @@ function getStyles(colors, isDark) {
     cellAreaW: { width: COL_AREA },
     cellNumW: { width: COL_NUM },
     cellAdvW: { width: COL_ADV },
-    cellEmiW: { width: COL_EMI },
+    cellEmiW: { width: COL_EMI, paddingHorizontal: 2 },
+    cellEmiStack: {
+      width: '100%',
+      alignItems: 'center',
+      justifyContent: 'center',
+      gap: 2,
+    },
+    cellEmiAmtRow: {
+      flexDirection: 'row',
+      flexWrap: 'wrap',
+      justifyContent: 'center',
+      alignItems: 'center',
+      alignContent: 'center',
+      width: '100%',
+      gap: 4,
+    },
+    cellEmiRupeeInRow: {
+      flexShrink: 1,
+      minWidth: 0,
+      textAlign: 'center',
+    },
+    cellEmiAmt: {
+      fontSize: 15,
+      lineHeight: 19,
+      fontWeight: '800',
+      color: colors.text,
+      textAlign: 'center',
+    },
+    cellEmiMult: {
+      fontSize: 15,
+      lineHeight: 19,
+      fontWeight: '900',
+      color: colors.textSecondary,
+      flexShrink: 0,
+    },
+    cellEmiTablePlus: {
+      width: '100%',
+      textAlign: 'center',
+      fontSize: 17,
+      fontWeight: '900',
+      lineHeight: 19,
+      color: colors.textSecondary,
+      paddingVertical: 0,
+    },
+    cellEmiLine: {
+      fontSize: 14,
+      lineHeight: 18,
+      fontWeight: '800',
+      color: colors.text,
+      textAlign: 'center',
+      width: '100%',
+    },
 
     // ── Cell text styles ──
     cellPlotTxt: { textAlign: 'center', fontWeight: '900' },
     cellAreaTxt: { textAlign: 'center' },
     cellNumTxt: { textAlign: 'center' },
+    cellMoneyText: {
+      width: '100%',
+      textAlign: 'center',
+      fontSize: 15,
+    },
 
     cell: {
       fontSize: 16,
@@ -634,7 +1076,8 @@ function getStyles(colors, isDark) {
     // ── Scholar button ──
     scholarBtn: {
       width: COL_SCHOLAR - 4,
-      height: 38,
+      minHeight: 56,
+      alignSelf: 'stretch',
       borderRadius: 10,
       alignItems: 'center',
       justifyContent: 'center',
@@ -648,34 +1091,93 @@ function getStyles(colors, isDark) {
       flex: 1,
       backgroundColor: 'rgba(0,0,0,0.55)',
       justifyContent: 'center',
-      paddingHorizontal: 20,
+      paddingHorizontal: 16,
+      paddingVertical: 10,
     },
     modalSheet: {
       backgroundColor: colors.surface,
-      borderRadius: 20,
-      padding: 22,
-      maxWidth: 440,
+      borderRadius: 18,
+      paddingVertical: 0,
+      paddingHorizontal: 0,
+      maxWidth: 520,
       alignSelf: 'center',
       width: '100%',
       borderWidth: 1,
       borderColor,
     },
+    modalScroll: {
+      flexGrow: 0,
+    },
+    modalScrollContent: {
+      paddingHorizontal: 14,
+      paddingTop: 12,
+      paddingBottom: 10,
+    },
     modalHeader: {
       flexDirection: 'row',
       alignItems: 'center',
-      gap: 10,
-      marginBottom: 6,
+      gap: 8,
+      marginBottom: 4,
     },
     modalTitle: {
       fontSize: 19,
       fontWeight: '800',
       color: colors.text,
     },
-    modalPlot: {
-      fontSize: 15,
-      color: colors.textSecondary,
-      fontWeight: '600',
-      marginBottom: 14,
+    modalPlotHighlightRow: {
+      flexDirection: 'row',
+      flexWrap: 'wrap',
+      justifyContent: 'center',
+      gap: 8,
+      marginBottom: 10,
+    },
+    modalPlotBadge: {
+      flexGrow: 1,
+      flexBasis: '42%',
+      minWidth: 132,
+      maxWidth: 200,
+      paddingVertical: 9,
+      paddingHorizontal: 12,
+      borderRadius: 14,
+      borderWidth: 2,
+    },
+    /** Plot number — warm amber / gold */
+    modalPlotBadgePlot: {
+      borderColor: isDark ? '#fbbf24' : '#d97706',
+      backgroundColor: isDark ? '#422006' : '#fffbeb',
+    },
+    modalPlotBadgeLabelPlot: {
+      fontSize: 11,
+      fontWeight: '800',
+      letterSpacing: 1,
+      color: isDark ? '#fcd34d' : '#b45309',
+      textTransform: 'uppercase',
+      marginBottom: 4,
+      textAlign: 'center',
+    },
+    modalPlotBadgeValuePlot: {
+      fontSize: 30,
+      fontWeight: '900',
+      color: isDark ? '#fef3c7' : '#78350f',
+      textAlign: 'center',
+    },
+    /** Area — cool cyan / teal */
+    modalPlotBadgeAreaCard: {
+      borderColor: isDark ? '#22d3ee' : '#0891b2',
+      backgroundColor: isDark ? '#083344' : '#ecfeff',
+    },
+    modalPlotBadgeLabelArea: {
+      fontSize: 11,
+      fontWeight: '800',
+      letterSpacing: 0.4,
+      color: isDark ? '#a5f3fc' : '#0e7490',
+      marginBottom: 4,
+      textAlign: 'center',
+    },
+    modalPlotBadgeValueArea: {
+      fontSize: 30,
+      fontWeight: '900',
+      color: isDark ? '#ecfeff' : '#155e75',
       textAlign: 'center',
     },
 
@@ -690,12 +1192,25 @@ function getStyles(colors, isDark) {
       flexDirection: 'row',
       backgroundColor: modalHeaderBg,
     },
+    compareHeaderColBorder: {
+      borderLeftWidth: 1,
+      borderLeftColor: isDark ? 'rgba(255,255,255,0.22)' : 'rgba(255,255,255,0.35)',
+    },
+    compareColBorder: {
+      borderLeftWidth: 1,
+      borderLeftColor: borderColor,
+    },
     compareCellWrap: {
       flex: 1,
       justifyContent: 'center',
       alignItems: 'center',
-      paddingVertical: 12,
+      paddingVertical: 8,
       paddingHorizontal: 4,
+    },
+    compareCellEmiPad: {
+      paddingVertical: 6,
+      paddingHorizontal: 5,
+      alignItems: 'stretch',
     },
     compareLabelWrap: {
       alignItems: 'flex-start',
@@ -711,10 +1226,83 @@ function getStyles(colors, isDark) {
       flexDirection: 'row',
       borderBottomWidth: StyleSheet.hairlineWidth,
       borderBottomColor: borderColor,
+      alignItems: 'center',
+    },
+    compareRowEmi: {
+      alignItems: 'stretch',
     },
     compareCell: {
       fontSize: 15,
       fontWeight: '600',
+      color: colors.text,
+      textAlign: 'center',
+    },
+    compareCellAmount: {
+      fontSize: 16,
+      fontWeight: '800',
+      color: colors.text,
+      textAlign: 'center',
+      width: '100%',
+      flexShrink: 1,
+    },
+    modalEmiColumnBox: {
+      width: '100%',
+      borderWidth: 1,
+      borderColor,
+      borderRadius: 10,
+      backgroundColor: isDark ? '#0f172a' : '#f1f5f9',
+      overflow: 'hidden',
+    },
+    modalEmiColumnBoxScholar: {
+      borderColor: isDark ? '#7c3aed' : '#a78bfa',
+      backgroundColor: isDark ? '#1e1033' : '#f5f3ff',
+    },
+    modalEmiColInner: {
+      width: '100%',
+    },
+    modalEmiPlus: {
+      width: '100%',
+      textAlign: 'center',
+      fontSize: 18,
+      fontWeight: '900',
+      lineHeight: 20,
+      color: colors.text,
+      paddingVertical: 0,
+    },
+    modalEmiLineBox: {
+      flexDirection: 'column',
+      alignItems: 'center',
+      justifyContent: 'center',
+      width: '100%',
+      paddingVertical: 7,
+      paddingHorizontal: 8,
+      gap: 6,
+      borderBottomWidth: StyleSheet.hairlineWidth,
+      borderBottomColor: borderColor,
+    },
+    modalEmiLineBoxLast: {
+      borderBottomWidth: 0,
+    },
+    modalEmiAmountBlock: {
+      width: '100%',
+      textAlign: 'center',
+    },
+    modalEmiSuffixPill: {
+      borderWidth: 1,
+      borderColor,
+      borderRadius: 8,
+      paddingVertical: 4,
+      paddingHorizontal: 12,
+      backgroundColor: isDark ? '#1e293b' : '#fff',
+      flexShrink: 0,
+    },
+    modalEmiSuffixPillScholar: {
+      borderColor: isDark ? '#a78bfa' : '#7c3aed',
+      backgroundColor: isDark ? '#2e1065' : '#ede9fe',
+    },
+    modalEmiSuffixPillText: {
+      fontSize: 15,
+      fontWeight: '900',
       color: colors.text,
       textAlign: 'center',
     },
@@ -753,13 +1341,12 @@ function getStyles(colors, isDark) {
     savingsValue: {
       color: '#16a34a',
       fontWeight: '900',
-      fontSize: 15,
     },
 
     modalClose: {
-      marginTop: 16,
-      paddingVertical: 14,
-      borderRadius: 14,
+      marginTop: 10,
+      paddingVertical: 11,
+      borderRadius: 12,
       alignItems: 'center',
       backgroundColor: isDark ? '#334155' : '#f1f5f9',
     },

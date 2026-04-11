@@ -13,8 +13,10 @@ import {
   Share as NativeShare,
   Modal,
   TextInput,
+  ScrollView,
+  Pressable,
 } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useNavigation, useRoute, useFocusEffect } from '@react-navigation/native';
 import Svg from 'react-native-svg';
 import { ReactNativeZoomableView } from '@openspacelabs/react-native-zoomable-view';
@@ -31,6 +33,7 @@ import { useAlert } from '../context/AlertContext';
 import { useTheme } from '../context/ThemeContext';
 import { AuthContext } from '../context/AuthContext';
 import { usePermissions } from '../hooks/usePermissions';
+import { getTransferTargetValidationError } from '../utils/transferTargetValidation';
 import { useOnAppForeground } from '../hooks/useOnAppForeground';
 import {
   SITE_NAME,
@@ -42,6 +45,7 @@ import { mapCaptureRegistry } from '../utils/mapCaptureRef';
 import { getCometChatCommunityGroupId } from '../config/cometchatSettings';
 import { initCometChatOnce } from '../services/cometchatLifecycle';
 import { sendActivitySummaryMessage } from '../services/cometchatActivitySummary';
+import { buildNoteActivitySummaryText } from '../utils/activitySummaryMessages';
 import { devLog } from '../utils/devLog';
 import { toOrdinal } from '../utils/formatting';
 import { isBiometricAvailable, promptBiometric } from '../utils/biometricAuth';
@@ -59,6 +63,34 @@ function formatAmount(value) {
   return `Rs. ${n.toLocaleString()}`;
 }
 
+/** Before vacating, read booking / waiting from plot; merge with refund / removal payload for notifications. */
+function deriveVacantActivityContext(plot, payload) {
+  if (!plot || !payload || payload.status !== 'vacant') return {};
+  if (plot.status === 'booked' && plot.bookingDetails) {
+    const bd = plot.bookingDetails;
+    return {
+      customerName: String(bd.customerName || '').trim() || '-',
+      refundMode: String(payload.refundMode || '').trim(),
+      refundAmount: payload.refundAmount,
+      refundBy: String(payload.refundBy || '').trim(),
+      refundRemarks: String(payload.refundRemarks || '').trim(),
+    };
+  }
+  if (plot.status === 'waiting' && Array.isArray(plot.waitingList) && plot.waitingList.length > 0) {
+    const names = plot.waitingList
+      .map((w) => String(w.customerName || '').trim())
+      .filter(Boolean);
+    return {
+      customerName: names.length ? names.join(', ') : '-',
+      removalRemarks: String(payload.removalRemarks || '').trim(),
+    };
+  }
+  return {
+    customerName: '-',
+    removalRemarks: String(payload.removalRemarks || '').trim(),
+  };
+}
+
 function buildStatusActivityMessage({
   status,
   plotNumber,
@@ -69,6 +101,11 @@ function buildStatusActivityMessage({
   paymentMode,
   actor,
   at,
+  refundMode,
+  refundAmount,
+  refundBy,
+  refundRemarks,
+  removalRemarks,
 }) {
   const plotLabel = `Plot No. ${plotNumber}`;
   const actorLabel = actor || 'Owner';
@@ -86,7 +123,30 @@ function buildStatusActivityMessage({
     return `${plotLabel}, ${customer}, Final, Booking details: ${amount} paid to ${paidTo} via ${paidVia}, by ${actorLabel} on ${when}.`;
   }
   if (status === 'vacant') {
-    return `${plotLabel} OPEN by ${actorLabel} on ${when}.`;
+    const parts = [`${plotLabel} marked OPEN`];
+    if (customer && customer !== '-') {
+      parts.push(`cleared: ${customer}`);
+    }
+    const rm = String(refundMode || '').trim();
+    if (rm) {
+      parts.push(
+        `Refund ${formatAmount(refundAmount)} via ${rm}${
+          refundBy ? ` (recorded by ${refundBy})` : ''
+        }`,
+      );
+      const rr = String(refundRemarks || '').trim();
+      if (rr) {
+        parts.push(rr.length > 180 ? `Refund notes: ${rr.slice(0, 177)}…` : `Refund notes: ${rr}`);
+      }
+    }
+    const wr = String(removalRemarks || '').trim();
+    if (wr) {
+      parts.push(
+        wr.length > 180 ? `Waiting cancel / notes: ${wr.slice(0, 177)}…` : `Waiting cancel / notes: ${wr}`,
+      );
+    }
+    parts.push(`by ${actorLabel} on ${when}.`);
+    return parts.join('. ');
   }
   if (status === 'BM') {
     return `${plotLabel} reserved for BM by ${actorLabel} on ${when}.`;
@@ -98,18 +158,22 @@ const MAP_MARGIN_H = 18;
 const MAP_CARD_PADDING = 10;
 const MAP_BORDER = 2;
 
-const LEGEND_ITEMS = [
-  { color: '#2e7d32', label: 'Booked',        border: null      },
-  { color: '#ffeb3b', label: 'Waiting',        border: null      },
-  { color: '#f97316', label: 'Multi Waiting',  border: null      },
-  { color: '#0ea5e9', label: 'Reserved (BM)',  border: null      },
-  { color: '#ffffff', label: 'Open',           border: '#94a3b8' },
+/** Legend pills: tap to filter the map (Open = count only, map unchanged). */
+const LAYOUT_LEGEND = [
+  { filterKey: 'booked', countKey: 'booked', color: '#2e7d32', label: 'Booked', border: null },
+  { filterKey: 'waiting', countKey: 'waiting', color: '#ffeb3b', label: 'Waiting', border: null },
+  { filterKey: 'waiting_multi', countKey: 'waitingMulti', color: '#f97316', label: 'Multiple Waiting', border: null },
+  { filterKey: 'BM', countKey: 'bm', color: '#0ea5e9', label: 'Reserved BM', border: null },
+  { filterKey: 'open', countKey: 'open', color: '#ffffff', label: 'Open', border: '#94a3b8' },
 ];
+
+const LAYOUT_LEGEND_ROWS = [LAYOUT_LEGEND.slice(0, 3), LAYOUT_LEGEND.slice(3, 5)];
 const ADMIN_OVERRIDE_PASSWORD = '8811';
 
 const LayoutScreen = () => {
   const navigation = useNavigation();
   const route = useRoute();
+  const insets = useSafeAreaInsets();
   const { isDark, colors } = useTheme();
   const styles = React.useMemo(() => getStyles(colors, isDark), [colors, isDark]);
   const { showAlert } = useAlert();
@@ -119,7 +183,7 @@ const LayoutScreen = () => {
     enableTemporaryGuestMode,
     disableTemporaryGuestMode,
   } = useContext(AuthContext);
-  const { canEdit, canUseChat, canBulkSelect, canViewDetails } = usePermissions();
+  const { canEdit, canUseChat, canBulkSelect, canViewDetails, isGuest } = usePermissions();
   const [plots, setPlots] = useState([]);
   const [loading, setLoading] = useState(true);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -138,6 +202,14 @@ const LayoutScreen = () => {
   const [showGuestDisableModal, setShowGuestDisableModal] = useState(false);
   const [guestDisableUsePassword, setGuestDisableUsePassword] = useState(false);
   const [guestDisablePassword, setGuestDisablePassword] = useState('');
+
+  /** null | 'booked' | 'waiting' | 'waiting_multi' | 'BM' | 'open' — open = counts only, no map dimming */
+  const [mapStatusFilter, setMapStatusFilter] = useState(null);
+  const [mapFilterModalVisible, setMapFilterModalVisible] = useState(false);
+
+  /** Booking sheet: user chose to pick transfer destination by tapping the layout */
+  const [transferMapPick, setTransferMapPick] = useState(null);
+  const [pendingTransferTargetPlot, setPendingTransferTargetPlot] = useState(null);
 
   const innerViewRef = useRef(null);
   const shareCaptureRef = useRef(null);
@@ -158,6 +230,32 @@ const LayoutScreen = () => {
     MAP_BORDER * 2;
   const renderWidth = Math.max(200, innerMapWidth);
   const renderHeight = renderWidth * (2480 / 3509);
+
+  const layoutCounts = useMemo(() => {
+    let booked = 0;
+    let waiting = 0;
+    let waitingMulti = 0;
+    let bm = 0;
+    let open = 0;
+    for (const p of plots) {
+      if (p.status === 'booked') booked += 1;
+      else if (p.status === 'BM') bm += 1;
+      else if (p.status === 'vacant') open += 1;
+      else if (p.status === 'waiting') {
+        waiting += 1;
+        if ((p.waitingList?.length || 0) > 1) waitingMulti += 1;
+      }
+    }
+    return { booked, waiting, waitingMulti, bm, open };
+  }, [plots]);
+
+  const filterBannerLine = useMemo(() => {
+    if (!mapStatusFilter) return '';
+    const item = LAYOUT_LEGEND.find((x) => x.filterKey === mapStatusFilter);
+    if (!item) return '';
+    const n = layoutCounts[item.countKey];
+    return `${item.label} · ${n} plot${n === 1 ? '' : 's'}`;
+  }, [mapStatusFilter, layoutCounts]);
 
   const refreshUnread = useCallback(async () => {
     try {
@@ -378,6 +476,30 @@ const LayoutScreen = () => {
     const { pageX: tapPageX, pageY: tapPageY } = event.nativeEvent;
     hitTestPlot(tapPageX, tapPageY, (clickedPlot) => {
       if (!clickedPlot) return;
+
+      if (transferMapPick) {
+        const source = selectedPlot;
+        if (!source?._id) {
+          setTransferMapPick(null);
+          setModalVisible(true);
+          return;
+        }
+        const err = getTransferTargetValidationError(source, clickedPlot, transferMapPick.kind);
+        if (err) {
+          showAlert('Not allowed', err);
+          return;
+        }
+        const fresh = plots.find((p) => p._id === clickedPlot._id) || clickedPlot;
+        setPendingTransferTargetPlot(fresh);
+        setTransferMapPick(null);
+        setModalVisible(true);
+        return;
+      }
+
+      if (isGuest) {
+        navigation.navigate('PlotDetails', { plotId: clickedPlot._id });
+        return;
+      }
       if (isMultiSelectMode) {
         setSelectedPlots((prev) => {
           if (prev.find((p) => p._id === clickedPlot._id)) {
@@ -393,6 +515,7 @@ const LayoutScreen = () => {
   };
 
   const handleLongPress = (event) => {
+    if (transferMapPick) return;
     if (!canBulkSelect) return;
     suppressNextTapRef.current = true;
     const { pageX: tapPageX, pageY: tapPageY } = event.nativeEvent;
@@ -428,16 +551,19 @@ const LayoutScreen = () => {
             payload?.status === 'waiting'
               ? toOrdinal((p?.waitingList?.length || 0) + 1)
               : undefined;
+          const vacCtx =
+            payload?.status === 'vacant' ? deriveVacantActivityContext(p, payload) : {};
           const msg = buildStatusActivityMessage({
             status: payload?.status,
             plotNumber: p?.plotNumber,
-            customerName: payload?.customerName,
+            customerName: payload?.customerName || vacCtx.customerName,
             waitingOrdinal,
             advanceAmount: payload?.advanceAmount,
             paymentTo: payload?.paymentTo,
             paymentMode: payload?.paymentMode,
             actor,
             at,
+            ...vacCtx,
           });
           sendActivitySummaryMessage(msg).catch(() => {});
         });
@@ -449,16 +575,21 @@ const LayoutScreen = () => {
           payload?.status === 'waiting'
             ? toOrdinal((selectedPlot?.waitingList?.length || 0) + 1)
             : undefined;
+        const vacCtx =
+          payload?.status === 'vacant'
+            ? deriveVacantActivityContext(selectedPlot, payload)
+            : {};
         const msg = buildStatusActivityMessage({
           status: payload?.status,
           plotNumber: selectedPlot?.plotNumber,
-          customerName: payload?.customerName,
+          customerName: payload?.customerName || vacCtx.customerName,
           waitingOrdinal,
           advanceAmount: payload?.advanceAmount,
           paymentTo: payload?.paymentTo,
           paymentMode: payload?.paymentMode,
           actor,
           at,
+          ...vacCtx,
         });
         sendActivitySummaryMessage(msg).catch(() => {});
       }
@@ -500,6 +631,36 @@ const LayoutScreen = () => {
 
     if (evt.type === 'update_waiter') {
       const text = `${plotLabel}, ${customer}, Waiting details updated, by ${actor} on ${at}.`;
+      sendActivitySummaryMessage(text).catch(() => {});
+      return;
+    }
+
+    if (evt.type === 'update_booking') {
+      const text = `${plotLabel}, ${customer}, Booking details updated, by ${actor} on ${at}.`;
+      sendActivitySummaryMessage(text).catch(() => {});
+      return;
+    }
+
+    if (evt.type === 'note_activity') {
+      const text = buildNoteActivitySummaryText({
+        kind: evt.kind === 'booking' ? 'booking' : 'waiting',
+        isUpdate: !!evt.isUpdate,
+        plotNumber: evt.plotNumber,
+        customerName: evt.customerName,
+        preview: evt.preview,
+        actor,
+        at,
+      });
+      sendActivitySummaryMessage(text).catch(() => {});
+      return;
+    }
+
+    if (evt.type === 'plot_transfer') {
+      const from = evt.sourcePlotNumber ?? '-';
+      const to = evt.targetPlotNumber ?? '-';
+      const cust = String(evt.customerName || '').trim() || '-';
+      const kind = evt.kind === 'booking' ? 'Booking' : 'Waiting';
+      const text = `Plot transfer (${kind}): Plot No. ${from} → Plot No. ${to}, ${cust}, by ${actor} on ${at}.`;
       sendActivitySummaryMessage(text).catch(() => {});
     }
   }, [userInfo?.mobileNumber, userInfo?.name]);
@@ -817,6 +978,7 @@ const LayoutScreen = () => {
                       key={plot._id}
                       plot={plot}
                       isSelected={selectedPlots.some((p) => p._id === plot._id)}
+                      mapStatusFilter={mapStatusFilter}
                     />
                   ))}
                 </Svg>
@@ -824,24 +986,105 @@ const LayoutScreen = () => {
             </View>
           </ReactNativeZoomableView>
         </View>
+
+        {mapStatusFilter ? (
+          <View style={styles.filterBanner}>
+            <View style={styles.filterBannerTextCol}>
+              <Text style={styles.filterBannerLine}>{filterBannerLine}</Text>
+              {mapStatusFilter === 'open' ? (
+                <Text style={styles.filterBannerHint}>
+                  Open plots have no overlay colour — the map is unchanged.
+                </Text>
+              ) : (
+                <Text style={styles.filterBannerHint}>Other statuses are faded. Tap a plot as usual.</Text>
+              )}
+            </View>
+            <TouchableOpacity
+              style={styles.filterBannerClear}
+              onPress={() => setMapStatusFilter(null)}
+              accessibilityRole="button"
+              accessibilityLabel="Clear map filter and return to normal view"
+            >
+              <Icon name="arrow-back" size={18} color={colors.primary} />
+              <Text style={styles.filterBannerClearText}>Normal</Text>
+            </TouchableOpacity>
+          </View>
+        ) : null}
+
         <Text style={styles.mapHint}>Pinch to zoom · Pan to move · Tap a plot</Text>
 
-        {/* ── Colour legend ── */}
-        <View style={styles.legend}>
-          {LEGEND_ITEMS.map((item) => (
-            <View key={item.label} style={styles.legendItem}>
-              <View
-                style={[
-                  styles.legendSwatch,
-                  { backgroundColor: item.color },
-                  item.border ? { borderColor: item.border, borderWidth: 1 } : null,
-                ]}
-              />
-              <Text style={styles.legendLabel}>{item.label}</Text>
-            </View>
-          ))}
+        <View style={styles.legendCompactWrap}>
+          <View style={styles.legendCompactRows}>
+            {LAYOUT_LEGEND_ROWS.map((row, ri) => (
+              <View key={String(ri)} style={styles.legendCompactRow}>
+                {row.map((item) => (
+                  <View key={item.filterKey} style={styles.legendCompactItem}>
+                    <View
+                      style={[
+                        styles.legendKeySwatch,
+                        { backgroundColor: item.color },
+                        item.border
+                          ? { borderColor: item.border, borderWidth: 1 }
+                          : { borderColor: isDark ? '#475569' : '#64748b', borderWidth: 1 },
+                      ]}
+                    />
+                    <Text style={styles.legendCompactLabel} numberOfLines={1}>
+                      {item.label}
+                    </Text>
+                  </View>
+                ))}
+              </View>
+            ))}
+          </View>
+          <TouchableOpacity
+            style={[
+              styles.legendFilterOpenBtn,
+              { borderColor: colors.border, backgroundColor: colors.surface },
+              mapStatusFilter ? styles.legendFilterOpenBtnActive : null,
+            ]}
+            onPress={() => setMapFilterModalVisible(true)}
+            accessibilityRole="button"
+            accessibilityLabel={
+              mapStatusFilter ? 'Map filter active — open focus options' : 'Focus map by plot status'
+            }
+          >
+            <Icon name="tune" size={20} color={colors.primary} />
+          </TouchableOpacity>
         </View>
       </View>
+
+      {transferMapPick ? (
+        <View
+          style={[
+            styles.transferMapPickBanner,
+            {
+              bottom: Math.max(insets.bottom, 10) + (isMultiSelectMode && selectedPlots.length > 0 ? 72 : 8),
+              borderColor: colors.border,
+              backgroundColor: isDark ? '#2e1065' : '#ede9fe',
+            },
+          ]}
+        >
+          <View style={styles.transferMapPickBannerTextCol}>
+            <Text style={[styles.transferMapPickTitle, { color: colors.text }]}>
+              Choose destination plot
+            </Text>
+            <Text style={[styles.transferMapPickHint, { color: colors.textSecondary }]}>
+              Tap the plot on the map to transfer here
+            </Text>
+          </View>
+          <TouchableOpacity
+            style={[styles.transferMapPickCancel, { borderColor: colors.border }]}
+            onPress={() => {
+              setTransferMapPick(null);
+              setModalVisible(true);
+            }}
+            accessibilityRole="button"
+            accessibilityLabel="Cancel choosing plot on map"
+          >
+            <Text style={[styles.transferMapPickCancelText, { color: colors.primary }]}>Cancel</Text>
+          </TouchableOpacity>
+        </View>
+      ) : null}
 
       {isMultiSelectMode && selectedPlots.length > 0 && (
         <View style={styles.bottomBanner}>
@@ -880,10 +1123,19 @@ const LayoutScreen = () => {
         isBulk={!selectedPlot && isMultiSelectMode}
         bulkCount={selectedPlots.length}
         selectedPlots={selectedPlots}
+        readOnlyGuest={isGuest}
         onClose={() => {
           reopenBookingModalRef.current = false;
           setModalVisible(false);
           setSelectedPlot(null);
+          setTransferMapPick(null);
+          setPendingTransferTargetPlot(null);
+        }}
+        pendingTransferTarget={pendingTransferTargetPlot}
+        onConsumedPendingTransferTarget={() => setPendingTransferTargetPlot(null)}
+        onRequestTransferTargetByMap={({ kind, waitingId }) => {
+          setTransferMapPick({ kind, waitingId: waitingId ?? null });
+          setModalVisible(false);
         }}
         onPressPlotDetails={handleOpenPlotDetailsFromModal}
         onUpdate={handleUpdate}
@@ -962,7 +1214,6 @@ const LayoutScreen = () => {
               >
                 <Icon name="admin-panel-settings" size={22} color={colors.primary} />
                 <Text style={[styles.authChoiceTitle, { color: colors.text }]}>Admin PIN</Text>
-                <Text style={[styles.authChoiceHint, { color: colors.textSecondary }]}>Use 8811</Text>
               </TouchableOpacity>
             </View>
             {guestDisableUsePassword && (
@@ -972,14 +1223,18 @@ const LayoutScreen = () => {
                   value={guestDisablePassword}
                   onChangeText={setGuestDisablePassword}
                   secureTextEntry
-                  placeholder="Enter admin password"
-                  placeholderTextColor={colors.textSecondary}
+                  keyboardType="number-pad"
+                  accessibilityLabel="Admin PIN"
+                  placeholder="Enter admin PIN"
+                  placeholderTextColor={colors.placeholder}
                 />
                 <TouchableOpacity
-                  style={[styles.modalBtn, styles.modalBtnConfirm, styles.modalBtnWide]}
+                  style={styles.modalBtnSubmitPin}
                   onPress={() => { void submitGuestDisablePassword(); }}
+                  accessibilityRole="button"
+                  accessibilityLabel="Disable guest mode with admin PIN"
                 >
-                  <Text style={styles.modalBtnConfirmText}>Disable with Admin PIN</Text>
+                  <Text style={styles.modalBtnSubmitPinText}>Disable with Admin PIN</Text>
                 </TouchableOpacity>
               </>
             )}
@@ -995,6 +1250,90 @@ const LayoutScreen = () => {
                 <Text style={styles.modalBtnCancelText}>Cancel</Text>
               </TouchableOpacity>
             </View>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal
+        visible={mapFilterModalVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setMapFilterModalVisible(false)}
+      >
+        <View style={styles.filterMapModalRoot}>
+          <Pressable
+            style={StyleSheet.absoluteFill}
+            onPress={() => setMapFilterModalVisible(false)}
+            accessibilityLabel="Dismiss"
+          />
+          <View
+            style={[styles.filterMapModalCard, { backgroundColor: colors.surface, borderColor: colors.border }]}
+          >
+            <Text style={[styles.filterMapModalTitle, { color: colors.text }]}>Focus map</Text>
+            <Text style={[styles.filterMapModalSubtitle, { color: colors.textSecondary }]}>
+              Highlight one status. Other plots fade. Open only updates the count — map colours stay the same.
+            </Text>
+            <ScrollView
+              keyboardShouldPersistTaps="handled"
+              showsVerticalScrollIndicator={false}
+              style={styles.filterMapModalScroll}
+            >
+              <View style={styles.filterModalPillRow}>
+                {LAYOUT_LEGEND.map((item) => {
+                  const count = layoutCounts[item.countKey];
+                  const active = mapStatusFilter === item.filterKey;
+                  return (
+                    <TouchableOpacity
+                      key={item.filterKey}
+                      activeOpacity={0.85}
+                      onPress={() => {
+                        setMapStatusFilter((prev) => (prev === item.filterKey ? null : item.filterKey));
+                        setMapFilterModalVisible(false);
+                      }}
+                      style={[styles.filterModalPill, active && styles.filterModalPillActive]}
+                      accessibilityRole="button"
+                      accessibilityLabel={`${item.label}, ${count} plots${active ? ', currently selected' : ''}`}
+                    >
+                      <View
+                        style={[
+                          styles.filterModalPillDot,
+                          { backgroundColor: item.color },
+                          item.border ? { borderColor: item.border, borderWidth: 1 } : null,
+                        ]}
+                      />
+                      <Text style={[styles.filterModalPillLabel, { color: colors.text }]} numberOfLines={1}>
+                        {item.label}
+                      </Text>
+                      <View style={[styles.filterModalPillBadge, { backgroundColor: isDark ? '#334155' : '#e2e8f0' }]}>
+                        <Text style={[styles.filterModalPillBadgeText, { color: isDark ? '#e2e8f0' : '#475569' }]}>
+                          {count}
+                        </Text>
+                      </View>
+                    </TouchableOpacity>
+                  );
+                })}
+              </View>
+              {mapStatusFilter ? (
+                <TouchableOpacity
+                  style={[styles.filterModalClearRow, { borderColor: colors.border }]}
+                  onPress={() => {
+                    setMapStatusFilter(null);
+                    setMapFilterModalVisible(false);
+                  }}
+                >
+                  <Icon name="highlight-off" size={20} color={colors.primary} />
+                  <Text style={[styles.filterModalClearText, { color: colors.primary }]}>
+                    Clear focus — show all plots
+                  </Text>
+                </TouchableOpacity>
+              ) : null}
+            </ScrollView>
+            <TouchableOpacity
+              style={[styles.filterMapModalDone, { backgroundColor: colors.primary }]}
+              onPress={() => setMapFilterModalVisible(false)}
+            >
+              <Text style={styles.filterMapModalDoneText}>Done</Text>
+            </TouchableOpacity>
           </View>
         </View>
       </Modal>
@@ -1178,9 +1517,90 @@ function getStyles(colors, isDark) {
       textAlign: 'center',
       fontSize: 12,
       color: colors.textSecondary,
-      marginTop: 8,
+      marginTop: 4,
       fontWeight: '500',
     },
+    filterBanner: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      marginTop: 6,
+      paddingVertical: 11,
+      paddingHorizontal: 12,
+      borderRadius: 14,
+      backgroundColor: isDark ? '#1e293b' : '#eef2ff',
+      borderWidth: 1,
+      borderColor: isDark ? '#334155' : '#c7d2fe',
+      gap: 10,
+    },
+    filterBannerTextCol: {
+      flex: 1,
+      minWidth: 0,
+    },
+    filterBannerLine: {
+      fontSize: 15,
+      fontWeight: '800',
+      color: colors.text,
+    },
+    filterBannerHint: {
+      fontSize: 11,
+      marginTop: 3,
+      color: colors.textSecondary,
+      fontWeight: '600',
+      lineHeight: 15,
+    },
+    filterBannerClear: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 4,
+      paddingVertical: 8,
+      paddingHorizontal: 11,
+      borderRadius: 12,
+      backgroundColor: colors.surface,
+      borderWidth: 1,
+      borderColor: cardBorder,
+    },
+    filterBannerClearText: {
+      fontSize: 13,
+      fontWeight: '800',
+      color: colors.primary,
+    },
+    transferMapPickBanner: {
+      position: 'absolute',
+      alignSelf: 'center',
+      left: 14,
+      right: 14,
+      maxWidth: 520,
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      gap: 12,
+      paddingHorizontal: 16,
+      paddingVertical: 14,
+      borderRadius: 16,
+      borderWidth: 1.5,
+      elevation: 10,
+      zIndex: 50,
+      ...Platform.select({
+        ios: {
+          shadowColor: '#000',
+          shadowOffset: { width: 0, height: 4 },
+          shadowOpacity: 0.18,
+          shadowRadius: 10,
+        },
+      }),
+    },
+    transferMapPickBannerTextCol: { flex: 1, minWidth: 0 },
+    transferMapPickTitle: { fontSize: 16, fontWeight: '800' },
+    transferMapPickHint: { fontSize: 12, fontWeight: '600', marginTop: 4, lineHeight: 16 },
+    transferMapPickCancel: {
+      paddingVertical: 10,
+      paddingHorizontal: 14,
+      borderRadius: 12,
+      borderWidth: 1,
+      backgroundColor: isDark ? '#1a1a1a' : '#fff',
+    },
+    transferMapPickCancelText: { fontWeight: '800', fontSize: 14 },
+
     bottomBanner: {
       position: 'absolute',
       bottom: 20,
@@ -1236,39 +1656,166 @@ function getStyles(colors, isDark) {
       fontSize: 14,
     },
 
-    // ── Colour legend ──────────────────────────────────────────────────────
-    legend: {
+    // ── Compact map key (2 lines) + tune opens filter modal ─────────────────
+    legendCompactWrap: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      marginTop: 6,
+      paddingVertical: 2,
+      gap: 10,
+    },
+    legendCompactRows: {
+      flex: 1,
+      minWidth: 0,
+      gap: 4,
+    },
+    legendCompactRow: {
+      flexDirection: 'row',
+      flexWrap: 'wrap',
+      alignItems: 'center',
+      columnGap: 12,
+      rowGap: 4,
+    },
+    legendCompactItem: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 5,
+    },
+    legendKeySwatch: {
+      width: 12,
+      height: 12,
+      borderRadius: 2,
+    },
+    legendCompactLabel: {
+      fontSize: 10,
+      fontWeight: '800',
+      color: colors.textSecondary,
+      flexShrink: 1,
+    },
+    legendFilterOpenBtn: {
+      width: 44,
+      height: 44,
+      borderRadius: 12,
+      borderWidth: 1,
+      alignItems: 'center',
+      justifyContent: 'center',
+      flexShrink: 0,
+      ...Platform.select({
+        ios: {
+          shadowColor: '#000',
+          shadowOffset: { width: 0, height: 1 },
+          shadowOpacity: isDark ? 0.25 : 0.08,
+          shadowRadius: 3,
+        },
+        android: { elevation: 2 },
+      }),
+    },
+    legendFilterOpenBtnActive: {
+      borderWidth: 2,
+      borderColor: colors.primary,
+    },
+    filterMapModalRoot: {
+      flex: 1,
+      backgroundColor: 'rgba(0,0,0,0.5)',
+      justifyContent: 'center',
+      paddingHorizontal: 20,
+      paddingVertical: 24,
+    },
+    filterMapModalCard: {
+      borderRadius: 16,
+      borderWidth: 1,
+      padding: 16,
+      maxHeight: '88%',
+      width: '100%',
+      maxWidth: 400,
+      alignSelf: 'center',
+    },
+    filterMapModalTitle: {
+      fontSize: 18,
+      fontWeight: '800',
+      marginBottom: 6,
+      textAlign: 'center',
+    },
+    filterMapModalSubtitle: {
+      fontSize: 12,
+      fontWeight: '600',
+      lineHeight: 17,
+      marginBottom: 14,
+      textAlign: 'center',
+    },
+    filterMapModalScroll: {
+      maxHeight: 340,
+    },
+    filterModalPillRow: {
       flexDirection: 'row',
       flexWrap: 'wrap',
       justifyContent: 'center',
       alignItems: 'center',
-      gap: 6,
-      marginTop: 8,
-      marginHorizontal: MAP_MARGIN_H,
-      paddingVertical: 7,
-      paddingHorizontal: 10,
-      backgroundColor: isDark ? '#1e293b' : '#f1f5f9',
-      borderRadius: 10,
-      borderWidth: 1,
-      borderColor: isDark ? '#334155' : '#cbd5e1',
+      gap: 8,
     },
-    legendItem: {
+    filterModalPill: {
       flexDirection: 'row',
       alignItems: 'center',
-      gap: 5,
-      paddingHorizontal: 6,
+      gap: 6,
+      paddingVertical: 9,
+      paddingHorizontal: 12,
+      borderRadius: 999,
+      backgroundColor: isDark ? '#1e293b' : '#f1f5f9',
+      borderWidth: 1.5,
+      borderColor: isDark ? '#334155' : '#e2e8f0',
+    },
+    filterModalPillActive: {
+      borderColor: colors.primary,
+      backgroundColor: isDark ? 'rgba(59,130,246,0.22)' : 'rgba(59,130,246,0.12)',
+    },
+    filterModalPillDot: {
+      width: 12,
+      height: 12,
+      borderRadius: 6,
+    },
+    filterModalPillLabel: {
+      fontSize: 12,
+      fontWeight: '800',
+      maxWidth: 100,
+    },
+    filterModalPillBadge: {
+      minWidth: 24,
+      paddingHorizontal: 7,
       paddingVertical: 3,
+      borderRadius: 11,
+      alignItems: 'center',
+      justifyContent: 'center',
     },
-    legendSwatch: {
-      width: 13,
-      height: 13,
-      borderRadius: 3,
-    },
-    legendLabel: {
+    filterModalPillBadgeText: {
       fontSize: 11,
-      fontWeight: '700',
-      color: colors.textSecondary,
-      letterSpacing: 0.1,
+      fontWeight: '900',
+    },
+    filterModalClearRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'center',
+      gap: 8,
+      marginTop: 14,
+      paddingVertical: 12,
+      paddingHorizontal: 12,
+      borderRadius: 12,
+      borderWidth: 1,
+    },
+    filterModalClearText: {
+      fontSize: 14,
+      fontWeight: '800',
+    },
+    filterMapModalDone: {
+      marginTop: 14,
+      paddingVertical: 14,
+      borderRadius: 12,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    filterMapModalDoneText: {
+      color: '#fff',
+      fontSize: 16,
+      fontWeight: '800',
     },
     modalOverlay: {
       flex: 1,
@@ -1361,8 +1908,21 @@ function getStyles(colors, isDark) {
       color: '#fff',
       fontWeight: '800',
     },
-    modalBtnWide: {
+    /** Full-width primary action (avoid modalBtn flex:1 outside modalActions row — label can vanish). */
+    modalBtnSubmitPin: {
+      alignSelf: 'stretch',
+      width: '100%',
+      paddingVertical: 12,
+      borderRadius: 10,
+      alignItems: 'center',
+      justifyContent: 'center',
+      backgroundColor: '#dc2626',
       marginBottom: 10,
+    },
+    modalBtnSubmitPinText: {
+      color: '#ffffff',
+      fontSize: 15,
+      fontWeight: '800',
     },
   });
 

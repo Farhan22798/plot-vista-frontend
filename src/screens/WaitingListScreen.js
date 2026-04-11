@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   View,
   Text,
@@ -29,10 +29,26 @@ import api from '../services/api';
 import socket from '../services/socket';
 import { useTheme } from '../context/ThemeContext';
 import { useAlert } from '../context/AlertContext';
+import { AuthContext } from '../context/AuthContext';
 import { keyboardAvoidingBehavior } from '../utils/keyboardAvoiding';
+import { sendActivitySummaryMessage } from '../services/cometchatActivitySummary';
+import {
+  buildNoteActivitySummaryText,
+  formatActivitySummaryTimestamp,
+} from '../utils/activitySummaryMessages';
 
 import { toOrdinal, formatDateTime as formatDateTimeUtil, nameOnly } from '../utils/formatting';
+import {
+  getRemarkEntries,
+  formatRemarkEntryAuditLines,
+  formatRemarkLogForExport,
+  remarkEntriesSearchBlob,
+} from '../utils/remarkLog';
+import { idForApiPath } from '../utils/mongoId';
 import UserAvatar from '../components/UserAvatar';
+import RemarkLogSection from '../components/RemarkLogSection';
+import CustomerCategoryField from '../components/CustomerCategoryField';
+import { labelForCustomerCategory, normalizeCustomerCategory } from '../utils/customerCategory';
 import Orientation from 'react-native-orientation-locker';
 
 const normalizeDigits = (s) => String(s || '').replace(/\D/g, '');
@@ -51,6 +67,14 @@ function rowMatchesSearch(row, qRaw) {
     const raw = String(m).toLowerCase();
     if (raw.includes(qLower)) return true;
     if (qDigits.length >= 2 && normalizeDigits(m).includes(qDigits)) return true;
+  }
+  if (remarkEntriesSearchBlob(row.waiter).includes(qLower)) return true;
+  const catLabel = labelForCustomerCategory(row.waiter.customerCategory).toLowerCase();
+  if (catLabel.includes(qLower)) return true;
+  if (qLower === 'scholar' || qLower === 'regular' || qLower === 'alim' || qLower === 'hafiz') {
+    const n = normalizeCustomerCategory(row.waiter.customerCategory);
+    if (qLower === 'scholar' || qLower === 'alim' || qLower === 'hafiz') return n === 'scholar';
+    if (qLower === 'regular') return n === 'regular';
   }
   return false;
 }
@@ -72,8 +96,9 @@ const TABLE_COL = {
   wait: 76,
   name: 200,
   mobile: 200,
+  type: 96,
   address: 200,
-  remarks: 220,
+  remarks: 252,
   added: 132,
   by: 128,
   actions: 112,
@@ -144,6 +169,26 @@ const WaitingListScreen = () => {
   const { colors, isDark } = useTheme();
   const styles = useMemo(() => getStyles(colors, isDark), [colors, isDark]);
   const { showAlert } = useAlert();
+  const { userInfo } = useContext(AuthContext);
+
+  const notifyWaitingNoteToCometchat = useCallback(
+    ({ isUpdate, plotNumber, customerName, preview }) => {
+      const actor = String(userInfo?.name || userInfo?.mobileNumber || 'User').trim();
+      const at = formatActivitySummaryTimestamp();
+      sendActivitySummaryMessage(
+        buildNoteActivitySummaryText({
+          kind: 'waiting',
+          isUpdate,
+          plotNumber,
+          customerName,
+          preview,
+          actor,
+          at,
+        }),
+      ).catch(() => {});
+    },
+    [userInfo?.mobileNumber, userInfo?.name],
+  );
 
   const { width: windowWidth, height: windowHeight } = useWindowDimensions();
   const isLandscape = windowWidth > windowHeight;
@@ -180,7 +225,7 @@ const WaitingListScreen = () => {
   const [editName, setEditName] = useState('');
   const [editMobiles, setEditMobiles] = useState(['']);
   const [editAddress, setEditAddress] = useState('');
-  const [editRemarks, setEditRemarks] = useState('');
+  const [editCategory, setEditCategory] = useState('regular');
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedId, setSelectedId] = useState(null);
   const [sortBy, setSortBy] = useState(DEFAULT_SORT_BY);
@@ -321,8 +366,9 @@ const WaitingListScreen = () => {
       Waiting: toOrdinal(item.queuePosition),
       Name: item.waiter.customerName || '-',
       Contact: (item.waiter.customerMobiles || []).filter((m) => String(m).trim()).join(', ') || '-',
+      Type: labelForCustomerCategory(item.waiter.customerCategory),
       Address: (item.waiter.customerAddress || '').trim() || '-',
-      Remarks: (item.waiter.remarks || '').trim() || '-',
+      Remarks: formatRemarkLogForExport(item.waiter),
       Added: item.waiter.createdAt ? formatDateTimeUtil(item.waiter.createdAt) : '-',
       By: nameOnly(item.waiter.createdBy),
     }));
@@ -342,7 +388,18 @@ const WaitingListScreen = () => {
       return;
     }
 
-    const headers = ['Sr No', 'Plot No', 'Waiting', 'Name', 'Contact', 'Address', 'Remarks', 'Added', 'By'];
+    const headers = [
+      'Sr No',
+      'Plot No',
+      'Waiting',
+      'Name',
+      'Contact',
+      'Customer type',
+      'Address',
+      'Remarks',
+      'Added',
+      'By',
+    ];
     const workbook = new ExcelJS.Workbook();
     const sheet = workbook.addWorksheet('Waiting List');
 
@@ -352,6 +409,7 @@ const WaitingListScreen = () => {
       { header: 'Waiting', key: 'Waiting', width: 13 },
       { header: 'Name', key: 'Name', width: 25 },
       { header: 'Contact', key: 'Contact', width: 25 },
+      { header: 'Customer type', key: 'Type', width: 14 },
       { header: 'Address', key: 'Address', width: 30 },
       { header: 'Remarks', key: 'Remarks', width: 32 },
       { header: 'Added', key: 'Added', width: 24 },
@@ -423,9 +481,10 @@ const WaitingListScreen = () => {
       { key: 'Sr No', label: 'Sr', width: 34 },
       { key: 'Plot No', label: 'Plot', width: 42 },
       { key: 'Waiting', label: 'Waiting', width: 56 },
-      { key: 'Name', label: 'Name', width: 120 },
-      { key: 'Contact', label: 'Contact', width: 120 },
-      { key: 'Address', label: 'Address', width: 130 },
+      { key: 'Name', label: 'Name', width: 108 },
+      { key: 'Contact', label: 'Contact', width: 108 },
+      { key: 'Type', label: 'Type', width: 52 },
+      { key: 'Address', label: 'Address', width: 124 },
       { key: 'Remarks', label: 'Remarks', width: 138 },
       { key: 'By', label: 'By', width: 78 },
       { key: 'Added', label: 'Added', width: 84 },
@@ -692,7 +751,7 @@ const WaitingListScreen = () => {
     setEditName(item.waiter.customerName || '');
     setEditMobiles(mobiles.length ? mobiles : ['']);
     setEditAddress(item.waiter.customerAddress || '');
-    setEditRemarks(item.waiter.remarks || '');
+    setEditCategory(normalizeCustomerCategory(item.waiter.customerCategory));
   };
 
   const closeEdit = () => {
@@ -701,7 +760,7 @@ const WaitingListScreen = () => {
     setEditName('');
     setEditMobiles(['']);
     setEditAddress('');
-    setEditRemarks('');
+    setEditCategory('regular');
   };
 
   const addEditMobile = () => {
@@ -737,7 +796,7 @@ const WaitingListScreen = () => {
         customerName: name,
         customerMobiles: mobiles,
         customerAddress: editAddress.trim(),
-        remarks: editRemarks.trim(),
+        customerCategory: normalizeCustomerCategory(editCategory),
       });
       if (res?.data?._id) {
         setPlots((prev) => prev.map((p) => (p._id === res.data._id ? res.data : p)));
@@ -774,6 +833,12 @@ const WaitingListScreen = () => {
   };
 
   const formatDateTime = formatDateTimeUtil;
+
+  const mergePlotFromRemarkResponse = useCallback((plotPayload) => {
+    if (!plotPayload?._id) return;
+    setPlots((prev) => prev.map((p) => (String(p._id) === String(plotPayload._id) ? plotPayload : p)));
+  }, []);
+
   const toggleFullscreen = useCallback(() => {
     if (isLandscape) {
       manualFullscreenRef.current = false;
@@ -809,6 +874,9 @@ const WaitingListScreen = () => {
       <Text style={[styles.tableCell, styles.tableHeaderText, styles.tableCellCenter, { width: TABLE_COL.mobile }]}>
         Contact
       </Text>
+      <Text style={[styles.tableCell, styles.tableHeaderText, styles.tableCellCenter, { width: TABLE_COL.type }]}>
+        Type
+      </Text>
       <Text style={[styles.tableCell, styles.tableHeaderText, styles.tableCellCenter, { width: TABLE_COL.address }]}>
         Address
       </Text>
@@ -830,7 +898,8 @@ const WaitingListScreen = () => {
   const renderTableRow = ({ item }) => {
     const mobiles = (item.waiter.customerMobiles || []).filter((m) => String(m).trim());
     const addr = (item.waiter.customerAddress || '').trim();
-    const rem = (item.waiter.remarks || '').trim();
+    const typeLabel = labelForCustomerCategory(item.waiter.customerCategory);
+    const remarkEntries = getRemarkEntries(item.waiter);
     const added = item.waiter.createdAt ? formatDateTime(item.waiter.createdAt) : '-';
     const by = nameOnly(item.waiter.createdBy);
     const rowId = `${item.plotId}:${item.waiter._id}`;
@@ -875,15 +944,68 @@ const WaitingListScreen = () => {
             ))
           )}
         </View>
+        <View style={[styles.tableCell, styles.tableCellCenteredCol, { width: TABLE_COL.type }]}>
+          <Text style={[styles.tableTextSmall, styles.tableTextCenter]} numberOfLines={2}>
+            {typeLabel}
+          </Text>
+        </View>
         <View style={[styles.tableCell, styles.tableCellCenteredCol, { width: TABLE_COL.address }]}>
           <Text style={[addr ? styles.tableText : styles.tableTextMuted, styles.tableTextCenter]}>
             {addr || '—'}
           </Text>
         </View>
-        <View style={[styles.tableCell, styles.tableCellCenteredCol, { width: TABLE_COL.remarks }]}>
-          <Text style={[rem ? styles.tableText : styles.tableTextMuted, styles.tableTextCenter]}>
-            {rem || '—'}
-          </Text>
+        <View style={[styles.tableCell, styles.remarksCellWithAdd, { width: TABLE_COL.remarks }]}>
+          <View style={styles.remarksCellTextCol}>
+            {remarkEntries.length === 0 ? (
+              <Text style={[styles.tableTextMuted, styles.tableTextCenter]}>—</Text>
+            ) : (
+              remarkEntries.map((e, ei) => (
+                <View key={e._id != null ? String(e._id) : `e-${ei}`} style={styles.remarksTableBlock}>
+                  <Text style={[styles.tableText, styles.tableTextCenter]}>{e.text}</Text>
+                  {formatRemarkEntryAuditLines(e).map((line, li) => (
+                    <Text
+                      key={li}
+                      style={[styles.tableTextSmall, styles.tableTextCenter, styles.remarksUpdatedMuted]}
+                    >
+                      {line}
+                    </Text>
+                  ))}
+                </View>
+              ))
+            )}
+          </View>
+          <RemarkLogSection
+            listDisplay="addButtonOnly"
+            entries={remarkEntries}
+            readOnly={false}
+            disabled={false}
+            onAdd={async (text) => {
+              const res = await api.post(
+                `/${idForApiPath(item.plotId)}/waiting/${idForApiPath(item.waiter._id)}/remarks`,
+                { text },
+              );
+              mergePlotFromRemarkResponse(res.data);
+              notifyWaitingNoteToCometchat({
+                isUpdate: false,
+                plotNumber: item.plotNumber,
+                customerName: item.waiter.customerName,
+                preview: text,
+              });
+            }}
+            onPatch={async (rid, text) => {
+              const res = await api.patch(
+                `/${idForApiPath(item.plotId)}/waiting/${idForApiPath(item.waiter._id)}/remarks/${rid}`,
+                { text },
+              );
+              mergePlotFromRemarkResponse(res.data);
+              notifyWaitingNoteToCometchat({
+                isUpdate: true,
+                plotNumber: item.plotNumber,
+                customerName: item.waiter.customerName,
+                preview: text,
+              });
+            }}
+          />
         </View>
         <View style={[styles.tableCell, styles.tableCellCenteredCol, { width: TABLE_COL.added }]}>
           <Text style={[styles.tableTextSmall, styles.tableTextCenter]}>{added}</Text>
@@ -1253,7 +1375,7 @@ const WaitingListScreen = () => {
             <View style={styles.modalCard}>
               <Text style={styles.modalTitle}>Edit Waiting Details</Text>
               <Text style={styles.modalSubtitle}>
-                Update customer info and remarks. Add or remove mobile rows like Add Waiting.
+                Update customer info. Use Notes below to add or fix spelling — each note keeps date and author.
               </Text>
 
               <ScrollView
@@ -1317,18 +1439,44 @@ const WaitingListScreen = () => {
                   onChangeText={setEditAddress}
                   editable={!savingEdit}
                 />
-                <Text style={styles.inputLabel}>Remarks</Text>
-                <TextInput
-                  style={styles.modalInputMultiline}
-                  placeholder="Any comments or notes…"
-                  placeholderTextColor={colors.placeholder}
-                  value={editRemarks}
-                  onChangeText={setEditRemarks}
-                  multiline
-                  numberOfLines={4}
-                  textAlignVertical="top"
-                  editable={!savingEdit}
+                <CustomerCategoryField
+                  value={editCategory}
+                  onChange={setEditCategory}
+                  disabled={savingEdit}
                 />
+                {editTarget ? (
+                  <RemarkLogSection
+                    entries={getRemarkEntries(editTarget.waiter)}
+                    readOnly={false}
+                    disabled={savingEdit}
+                    onAdd={async (text) => {
+                      const res = await api.post(
+                        `/${idForApiPath(editTarget.plotId)}/waiting/${idForApiPath(editTarget.waiter._id)}/remarks`,
+                        { text },
+                      );
+                      mergePlotFromRemarkResponse(res.data);
+                      notifyWaitingNoteToCometchat({
+                        isUpdate: false,
+                        plotNumber: editTarget.plotNumber,
+                        customerName: editTarget.waiter.customerName,
+                        preview: text,
+                      });
+                    }}
+                    onPatch={async (rid, text) => {
+                      const res = await api.patch(
+                        `/${idForApiPath(editTarget.plotId)}/waiting/${idForApiPath(editTarget.waiter._id)}/remarks/${rid}`,
+                        { text },
+                      );
+                      mergePlotFromRemarkResponse(res.data);
+                      notifyWaitingNoteToCometchat({
+                        isUpdate: true,
+                        plotNumber: editTarget.plotNumber,
+                        customerName: editTarget.waiter.customerName,
+                        preview: text,
+                      });
+                    }}
+                  />
+                ) : null}
               </ScrollView>
 
               <View style={styles.modalActions}>
@@ -1614,6 +1762,24 @@ const getStyles = (colors, isDark) =>
       color: colors.textSecondary,
       fontSize: 16,
       fontWeight: '600',
+    },
+    remarksUpdatedMuted: {
+      color: colors.textSecondary,
+      marginTop: 4,
+      fontStyle: 'italic',
+      fontSize: 12,
+      lineHeight: 16,
+    },
+    remarksTableBlock: { marginBottom: 8, width: '100%' },
+    remarksCellWithAdd: {
+      flexDirection: 'row',
+      alignItems: 'flex-start',
+      gap: 6,
+      paddingVertical: 4,
+    },
+    remarksCellTextCol: {
+      flex: 1,
+      minWidth: 0,
     },
     mobileLine: {
       flexDirection: 'row',

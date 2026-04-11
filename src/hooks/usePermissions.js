@@ -30,8 +30,9 @@ const ROLE_PERMISSIONS = {
   },
   guest: {
     canEdit: false,
-    canViewDetails: false,
-    canViewAreaStatement: false,
+    /** Browse map, open plot details, area statement — no edits or booking actions. */
+    canViewDetails: true,
+    canViewAreaStatement: true,
     canViewWaitingList: false,
     canViewSummary: false,
     canUseChat: false,

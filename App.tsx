@@ -88,7 +88,7 @@ function FullTabs() {
   );
 }
 
-/** Read-only navigator for guest role — map + profile tabs only. */
+/** Read-only navigator for guest role — map, area statement, profile. */
 function GuestTabs() {
   const { colors } = useTheme();
 
@@ -99,7 +99,9 @@ function GuestTabs() {
         headerTitleStyle: { fontWeight: 'bold', color: colors.text },
         headerTintColor: colors.text,
         tabBarIcon: ({ color, size }) => {
-          const iconName = route.name === 'Layout' ? 'map' : 'person';
+          let iconName = 'person';
+          if (route.name === 'Layout') iconName = 'map';
+          else if (route.name === 'Area Statement') iconName = 'pie-chart';
           return <Icon name={iconName} size={size} color={color} />;
         },
         tabBarActiveTintColor: colors.primary,
@@ -116,6 +118,11 @@ function GuestTabs() {
       })}
     >
       <Tab.Screen name="Layout" component={LayoutStack} options={{ title: 'Master Plan', headerShown: false, tabBarLabel: ({ color }) => <TabLabel color={color} line1="Master" line2="Plan" /> }} />
+      <Tab.Screen
+        name="Area Statement"
+        component={AreaStatementScreen}
+        options={{ title: 'Area Statement', tabBarLabel: ({ color }) => <TabLabel color={color} line1="Area" line2="Statement" /> }}
+      />
       <Tab.Screen name="Profile" component={ProfileScreen} options={{ title: 'User Profile', tabBarLabel: ({ color }) => <TabLabel color={color} line1="User" line2="Profile" /> }} />
     </Tab.Navigator>
   );

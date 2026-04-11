@@ -9,6 +9,8 @@ import { launchCamera } from 'react-native-image-picker';
 import Icon from '@react-native-vector-icons/material-design-icons';
 import api from '../services/api';
 import { displayActivityAction } from '../utils/activityLabels';
+import { getActivityHistoryDetailBlocks } from '../utils/activityHistoryDetails';
+import ActivityLogDetailPanels from './ActivityLogDetailPanels';
 import {
   toOrdinal,
   formatDateTime as formatDateTimeShared,
@@ -18,6 +20,12 @@ import {
 import { STATUS_COLORS, STATUS_TEXT_COLORS, getStatusSwatchColor } from '../constants/statusColors';
 import MobileBoxInput from './MobileBoxInput';
 import UserAvatar from './UserAvatar';
+import RemarkLogSection from './RemarkLogSection';
+import CustomerCategoryField from './CustomerCategoryField';
+import { getRemarkEntries, joinRemarkTexts } from '../utils/remarkLog';
+import { normalizeCustomerCategory, labelForCustomerCategory } from '../utils/customerCategory';
+import { idForApiPath } from '../utils/mongoId';
+import { getTransferTargetValidationError } from '../utils/transferTargetValidation';
 import { useAlert } from '../context/AlertContext';
 import { useTheme } from '../context/ThemeContext';
 import { keyboardAvoidingBehavior } from '../utils/keyboardAvoiding';
@@ -63,6 +71,13 @@ const BookingModal = ({
   onUpdate,
   onPressPlotDetails,
   onActivitySummary,
+  /** Hide history + quick actions; skip history API (e.g. guest / read-only). */
+  readOnlyGuest = false,
+  /** LayoutScreen: plot user tapped as transfer destination (consumed when applied). */
+  pendingTransferTarget = null,
+  onConsumedPendingTransferTarget,
+  /** Ask parent to hide sheet and enter “tap plot on map” mode. */
+  onRequestTransferTargetByMap,
 }) => {
   const { isDark, colors } = useTheme();
   const styles = React.useMemo(() => getStyles(colors, isDark), [colors, isDark]);
@@ -82,6 +97,7 @@ const BookingModal = ({
   const [customerName, setCustomerName] = useState('');
   const [customerMobiles, setCustomerMobiles] = useState(['']);
   const [customerAddress, setCustomerAddress] = useState('');
+  const [customerCategory, setCustomerCategory] = useState('regular');
   const [customerPhoto, setCustomerPhoto] = useState('');
   const [photoLocalUri, setPhotoLocalUri] = useState('');
   const [photoBase64, setPhotoBase64] = useState('');
@@ -107,11 +123,16 @@ const BookingModal = ({
   const [removeWaiterId, setRemoveWaiterId] = useState(null);
   const [removeWaiterReason, setRemoveWaiterReason] = useState('');
   const [isEditingWaiter, setIsEditingWaiter] = useState(false);
+  const [isSavingBookingEdit, setIsSavingBookingEdit] = useState(false);
+  const [editBookingOpen, setEditBookingOpen] = useState(false);
+  const [editBookingAdvanceAmount, setEditBookingAdvanceAmount] = useState('');
+  const [editBookingPaymentMode, setEditBookingPaymentMode] = useState('');
+  const [editBookingPaymentTo, setEditBookingPaymentTo] = useState('');
   const [editWaiterId, setEditWaiterId] = useState(null);
   const [editWaiterName, setEditWaiterName] = useState('');
   const [editWaiterMobiles, setEditWaiterMobiles] = useState(['']);
   const [editWaiterAddress, setEditWaiterAddress] = useState('');
-  const [editWaiterRemarks, setEditWaiterRemarks] = useState('');
+  const [editCustomerCategory, setEditCustomerCategory] = useState('regular');
 
   // History states
   const [showHistory, setShowHistory] = useState(false);
@@ -119,12 +140,20 @@ const BookingModal = ({
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
   const [queueImagePreviewUri, setQueueImagePreviewUri] = useState(null);
 
+  /** Plot transfer: 'target' = pick destination on layout, 'confirm' = review & submit */
+  const [transferStep, setTransferStep] = useState(null);
+  const [transferKind, setTransferKind] = useState(null);
+  const [transferWaitingId, setTransferWaitingId] = useState(null);
+  const [transferTargetPlot, setTransferTargetPlot] = useState(null);
+  const [transferExtraRemarks, setTransferExtraRemarks] = useState('');
+
   // Reset only when the target plot or bulk mode changes — not when the modal is hidden
   // to view Plot details (so back returns to the same step: quick actions, forms, history).
   useEffect(() => {
     setCustomerName('');
     setCustomerMobiles(['']);
     setCustomerAddress('');
+    setCustomerCategory('regular');
     setCustomerPhoto('');
     setPhotoLocalUri('');
     setPhotoBase64('');
@@ -149,16 +178,26 @@ const BookingModal = ({
     setRemoveWaiterId(null);
     setRemoveWaiterReason('');
     setIsEditingWaiter(false);
+    setIsSavingBookingEdit(false);
+    setEditBookingOpen(false);
+    setEditBookingAdvanceAmount('');
+    setEditBookingPaymentMode('');
+    setEditBookingPaymentTo('');
     setEditWaiterId(null);
     setEditWaiterName('');
     setEditWaiterMobiles(['']);
     setEditWaiterAddress('');
-    setEditWaiterRemarks('');
-
+    setEditCustomerCategory('regular');
     setShowHistory(false);
     setHistory([]);
     setQueueImagePreviewUri(null);
     bookedFlowSourceRef.current = null;
+
+    setTransferStep(null);
+    setTransferKind(null);
+    setTransferWaitingId(null);
+    setTransferTargetPlot(null);
+    setTransferExtraRemarks('');
   }, [plot?._id, isBulk]);
 
   useEffect(() => {
@@ -171,15 +210,16 @@ const BookingModal = ({
     if (!visible) setQueueImagePreviewUri(null);
   }, [visible]);
 
-  // Re-fetch history when the modal opens, or when the same plot receives a new
-  // action (detected via historySummary length change from socket updates).
-  const historySummaryLength = plot?.historySummary?.length ?? 0;
+  // Re-fetch ActivityLog when the modal is open and this plot changes on the server.
+  // Use updatedAt so we still refresh when historySummary is capped at 100 entries (length unchanged).
+  const plotSyncKey =
+    plot?.updatedAt != null ? String(plot.updatedAt) : `${plot?._id ?? ''}-${plot?.historySummary?.length ?? 0}`;
   useEffect(() => {
-    if (visible && plot && !isBulk) {
+    if (visible && plot && !isBulk && !readOnlyGuest) {
       fetchHistory();
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [visible, plot?._id, isBulk, historySummaryLength]);
+  }, [visible, plot?._id, isBulk, plotSyncKey, readOnlyGuest]);
 
   const fetchHistory = async () => {
     try {
@@ -192,6 +232,238 @@ const BookingModal = ({
       setIsLoadingHistory(false);
     }
   };
+
+  const emitNoteActivity = useCallback(
+    (kind, isUpdate, customerName, preview) => {
+      onActivitySummary?.({
+        type: 'note_activity',
+        kind,
+        isUpdate,
+        plotNumber: plot?.plotNumber,
+        customerName,
+        preview,
+      });
+    },
+    [onActivitySummary, plot?.plotNumber],
+  );
+
+  const cancelPlotTransfer = useCallback(() => {
+    setTransferStep(null);
+    setTransferKind(null);
+    setTransferWaitingId(null);
+    setTransferTargetPlot(null);
+    setTransferExtraRemarks('');
+  }, []);
+
+  const populateTransferFormFromBooking = useCallback((bd) => {
+    if (!bd) return;
+    setCustomerName(String(bd.customerName || '').trim());
+    const mobiles = (bd.customerMobiles || []).map((m) => String(m).trim()).filter(Boolean);
+    setCustomerMobiles(mobiles.length ? mobiles : ['']);
+    setCustomerAddress(String(bd.customerAddress || '').trim());
+    setCustomerCategory(normalizeCustomerCategory(bd.customerCategory));
+    const photoUrl = String(bd.customerPhoto || '').trim();
+    setCustomerPhoto(photoUrl);
+    setPhotoLocalUri(photoUrl && /^https?:\/\//i.test(photoUrl) ? photoUrl : '');
+    setPhotoBase64('');
+    setAdvanceAmount(
+      bd.advanceAmount != null && !Number.isNaN(Number(bd.advanceAmount))
+        ? String(bd.advanceAmount)
+        : '',
+    );
+    setPaymentMode(String(bd.paymentMode || '').trim());
+    setPaymentTo(String(bd.paymentTo || '').trim());
+    setRemarks('');
+    setTransferExtraRemarks('');
+    setAdminOverrideGranted(false);
+    setShowAdminOverride(false);
+    setAdminPassword('');
+  }, []);
+
+  const populateTransferFormFromWaiter = useCallback((w) => {
+    if (!w) return;
+    setCustomerName(String(w.customerName || '').trim());
+    const mobiles = (w.customerMobiles || []).map((m) => String(m).trim()).filter(Boolean);
+    setCustomerMobiles(mobiles.length ? mobiles : ['']);
+    setCustomerAddress(String(w.customerAddress || '').trim());
+    setCustomerCategory(normalizeCustomerCategory(w.customerCategory));
+    const photoUrl = String(w.customerPhoto || '').trim();
+    setCustomerPhoto(photoUrl);
+    setPhotoLocalUri(photoUrl && /^https?:\/\//i.test(photoUrl) ? photoUrl : '');
+    setPhotoBase64('');
+    setAdvanceAmount('');
+    setPaymentMode('');
+    setPaymentTo('');
+    setRemarks('');
+    setTransferExtraRemarks('');
+    setAdminOverrideGranted(false);
+    setShowAdminOverride(false);
+    setAdminPassword('');
+  }, []);
+
+  const beginTransferBooking = useCallback(() => {
+    if (!plot?.bookingDetails) return;
+    setActiveAction(null);
+    setTransferKind('booking');
+    setTransferWaitingId(null);
+    setTransferTargetPlot(null);
+    setTransferStep('target');
+  }, [plot?.bookingDetails]);
+
+  const beginTransferWaiter = useCallback((waitingId) => {
+    setActiveAction(null);
+    setTransferKind('waiting');
+    setTransferWaitingId(waitingId);
+    setTransferTargetPlot(null);
+    setTransferStep('target');
+  }, []);
+
+  const requestTransferTargetOnMap = useCallback(() => {
+    if (!transferKind || !onRequestTransferTargetByMap) return;
+    onRequestTransferTargetByMap({
+      kind: transferKind,
+      waitingId: transferKind === 'waiting' ? transferWaitingId : null,
+    });
+  }, [onRequestTransferTargetByMap, transferKind, transferWaitingId]);
+
+  useEffect(() => {
+    if (!visible || !pendingTransferTarget || !plot?._id || !transferKind) return;
+    if (transferStep !== 'target') return;
+    if (String(pendingTransferTarget._id) === String(plot._id)) {
+      showAlert('Invalid', 'Choose a different plot than the current one.');
+      onConsumedPendingTransferTarget?.();
+      return;
+    }
+    const err = getTransferTargetValidationError(plot, pendingTransferTarget, transferKind);
+    if (err) {
+      showAlert('Not allowed', err);
+      onConsumedPendingTransferTarget?.();
+      return;
+    }
+    setTransferTargetPlot(pendingTransferTarget);
+    if (transferKind === 'booking') {
+      populateTransferFormFromBooking(plot.bookingDetails);
+    } else {
+      const w = (plot.waitingList || []).find((x) => String(x._id) === String(transferWaitingId));
+      if (!w) {
+        showAlert('Error', 'Waiting entry not found.');
+        onConsumedPendingTransferTarget?.();
+        return;
+      }
+      populateTransferFormFromWaiter(w);
+    }
+    setTransferStep('confirm');
+    onConsumedPendingTransferTarget?.();
+  }, [
+    visible,
+    pendingTransferTarget,
+    plot,
+    transferKind,
+    transferWaitingId,
+    transferStep,
+    populateTransferFormFromBooking,
+    populateTransferFormFromWaiter,
+    showAlert,
+    onConsumedPendingTransferTarget,
+  ]);
+
+  const submitPlotTransfer = useCallback(async () => {
+    if (!plot?._id || !transferTargetPlot?._id || !transferKind) return;
+    if (!customerName.trim()) {
+      showAlert('Required', 'Customer name is required.');
+      return;
+    }
+    const validMobiles = customerMobiles.filter((m) => m.trim());
+    if (!validMobiles.length) {
+      showAlert('Required', 'At least one mobile number is required.');
+      return;
+    }
+    const badMobile = validMobiles.find((m) => m.replace(/\D/g, '').length !== 10);
+    if (badMobile) {
+      showAlert('Invalid Number', `"${badMobile}" is not a valid 10-digit mobile number.`);
+      return;
+    }
+    if (transferKind === 'booking') {
+      if (!advanceAmount && !adminOverrideGranted) {
+        showAlert(
+          'Advance Amount Required',
+          'Booking requires an advance amount. Enter it or use admin override.',
+          [
+            { text: 'Enter Amount', style: 'cancel' },
+            { text: 'Admin Override', onPress: () => setShowAdminOverride(true) },
+          ],
+        );
+        return;
+      }
+      if (!paymentMode) {
+        showAlert('Required', 'Please select a payment mode.');
+        return;
+      }
+    }
+
+    setIsSubmitting(true);
+    try {
+      let finalPhotoUrl = await uploadPhoto();
+      const existingPhoto = String(customerPhoto || '').trim();
+      if (!finalPhotoUrl && existingPhoto && /^https?:\/\//i.test(existingPhoto)) {
+        finalPhotoUrl = existingPhoto;
+      }
+      const overrides = {
+        customerName: customerName.trim(),
+        customerMobiles: validMobiles,
+        customerAddress: customerAddress.trim(),
+        customerCategory: normalizeCustomerCategory(customerCategory),
+        customerPhoto: finalPhotoUrl || '',
+        remarks: transferExtraRemarks.trim(),
+      };
+      if (transferKind === 'booking') {
+        overrides.advanceAmount = advanceAmount
+          ? parseFloat(String(advanceAmount).replace(/,/g, ''))
+          : null;
+        overrides.paymentMode = paymentMode;
+        overrides.paymentTo = paymentTo.trim();
+      }
+      await api.post(`/${idForApiPath(plot._id)}/transfer`, {
+        targetPlotId: idForApiPath(transferTargetPlot._id),
+        kind: transferKind,
+        ...(transferKind === 'waiting' ? { waitingId: idForApiPath(transferWaitingId) } : {}),
+        overrides,
+      });
+      onActivitySummary?.({
+        type: 'plot_transfer',
+        sourcePlotNumber: plot.plotNumber,
+        targetPlotNumber: transferTargetPlot.plotNumber,
+        customerName: customerName.trim(),
+        kind: transferKind,
+      });
+      cancelPlotTransfer();
+      onClose();
+    } catch (e) {
+      showAlert('Transfer failed', e.response?.data?.message || e.message || 'Try again.');
+    } finally {
+      setIsSubmitting(false);
+    }
+  }, [
+    plot,
+    transferTargetPlot,
+    transferKind,
+    transferWaitingId,
+    customerName,
+    customerMobiles,
+    customerAddress,
+    customerCategory,
+    customerPhoto,
+    advanceAmount,
+    paymentMode,
+    paymentTo,
+    transferExtraRemarks,
+    adminOverrideGranted,
+    uploadPhoto,
+    showAlert,
+    onActivitySummary,
+    onClose,
+    cancelPlotTransfer,
+  ]);
 
   const addMobile = () => {
     if (customerMobiles.length < 5) setCustomerMobiles([...customerMobiles, '']);
@@ -269,7 +541,8 @@ const BookingModal = ({
       const mobiles = (waiter.customerMobiles || []).map((m) => String(m).trim()).filter(Boolean);
       setCustomerMobiles(mobiles.length ? mobiles : ['']);
       setCustomerAddress(String(waiter.customerAddress || '').trim());
-      setRemarks(String(waiter.remarks || '').trim());
+      setCustomerCategory(normalizeCustomerCategory(waiter.customerCategory));
+      setRemarks(joinRemarkTexts(waiter));
       const photoUrl = String(waiter.customerPhoto || '').trim();
       setCustomerPhoto(photoUrl);
       setPhotoLocalUri(photoUrl && /^https?:\/\//i.test(photoUrl) ? photoUrl : '');
@@ -290,6 +563,7 @@ const BookingModal = ({
     setCustomerName('');
     setCustomerMobiles(['']);
     setCustomerAddress('');
+    setCustomerCategory('regular');
     setRemarks('');
     setCustomerPhoto('');
     setPhotoLocalUri('');
@@ -356,6 +630,11 @@ const BookingModal = ({
     if (!isBulk && plot) return plot.status === 'waiting';
     return false;
   }, [isBulk, selectedPlots, plot]);
+
+  const editingWaiterForNotes = React.useMemo(() => {
+    if (!editWaiterId || !plot?.waitingList) return null;
+    return plot.waitingList.find((w) => String(w._id) === String(editWaiterId)) || null;
+  }, [editWaiterId, plot?.waitingList]);
 
   const validateRefundClient = () => {
     if (!refundMode.trim()) return 'Select refund mode.';
@@ -471,6 +750,7 @@ const BookingModal = ({
         customerName: customerName.trim(),
         customerMobiles: mobiles,
         customerAddress: customerAddress.trim(),
+        customerCategory: normalizeCustomerCategory(customerCategory),
         customerPhoto: finalPhotoUrl,
         ...(status === 'booked' && {
           advanceAmount: advanceAmount ? parseFloat(advanceAmount) : null,
@@ -498,20 +778,47 @@ const BookingModal = ({
 
   const openEditWaiter = (waiter) => {
     const mobiles = (waiter?.customerMobiles || []).filter((m) => String(m).trim());
+    setEditBookingOpen(false);
+    setEditBookingAdvanceAmount('');
+    setEditBookingPaymentMode('');
+    setEditBookingPaymentTo('');
     setEditWaiterId(waiter?._id || null);
     setEditWaiterName(waiter?.customerName || '');
     setEditWaiterMobiles(mobiles.length ? mobiles : ['']);
     setEditWaiterAddress(waiter?.customerAddress || '');
-    setEditWaiterRemarks(waiter?.remarks || '');
+    setEditCustomerCategory(normalizeCustomerCategory(waiter?.customerCategory));
+  };
+
+  const openEditBooking = () => {
+    const bd = plot?.bookingDetails;
+    if (!bd) return;
+    setEditWaiterId(null);
+    setEditBookingOpen(true);
+    const mobiles = (bd.customerMobiles || []).filter((m) => String(m).trim());
+    setEditWaiterName(bd.customerName || '');
+    setEditWaiterMobiles(mobiles.length ? mobiles : ['']);
+    setEditWaiterAddress(bd.customerAddress || '');
+    setEditCustomerCategory(normalizeCustomerCategory(bd.customerCategory));
+    setEditBookingAdvanceAmount(
+      bd.advanceAmount != null && !Number.isNaN(Number(bd.advanceAmount))
+        ? String(bd.advanceAmount)
+        : '0',
+    );
+    setEditBookingPaymentMode(String(bd.paymentMode || '').trim());
+    setEditBookingPaymentTo(String(bd.paymentTo || '').trim());
   };
 
   const closeEditWaiter = () => {
-    if (isEditingWaiter) return;
+    if (isEditingWaiter || isSavingBookingEdit) return;
     setEditWaiterId(null);
+    setEditBookingOpen(false);
+    setEditBookingAdvanceAmount('');
+    setEditBookingPaymentMode('');
+    setEditBookingPaymentTo('');
     setEditWaiterName('');
     setEditWaiterMobiles(['']);
     setEditWaiterAddress('');
-    setEditWaiterRemarks('');
+    setEditCustomerCategory('regular');
   };
 
   const addEditWaiterMobile = () => {
@@ -608,7 +915,7 @@ const BookingModal = ({
         customerName: name,
         customerMobiles: mobiles,
         customerAddress: editWaiterAddress.trim(),
-        remarks: editWaiterRemarks.trim(),
+        customerCategory: normalizeCustomerCategory(editCustomerCategory),
       });
       onActivitySummary?.({
         type: 'update_waiter',
@@ -621,6 +928,72 @@ const BookingModal = ({
       showAlert('Error', msg);
     } finally {
       setIsEditingWaiter(false);
+    }
+  };
+
+  const saveEditBooking = async () => {
+    const name = editWaiterName.trim();
+    const mobiles = editWaiterMobiles.map((m) => String(m).trim()).filter(Boolean);
+    if (!name) {
+      showAlert('Required', 'Customer name is required.');
+      return;
+    }
+    if (!mobiles.length) {
+      showAlert('Required', 'At least one mobile number is required.');
+      return;
+    }
+    const badMobile = mobiles.find((m) => m.replace(/\D/g, '').length !== 10);
+    if (badMobile) {
+      showAlert('Invalid Number', `"${badMobile}" is not a valid 10-digit mobile number.`);
+      return;
+    }
+    if (!plot?._id || !plot.bookingDetails) return;
+
+    const advStr = editBookingAdvanceAmount.trim();
+    if (advStr === '') {
+      showAlert('Required', 'Advance amount is required (use 0 if there was none).');
+      return;
+    }
+    const advanceNum = parseFloat(advStr);
+    if (Number.isNaN(advanceNum) || advanceNum < 0) {
+      showAlert('Invalid', 'Advance must be a valid non-negative number.');
+      return;
+    }
+    if (!editBookingPaymentMode.trim()) {
+      showAlert('Required', 'Payment mode is required.');
+      return;
+    }
+
+    try {
+      setIsSavingBookingEdit(true);
+      await api.patch(`/${plot._id}/booking`, {
+        customerName: name,
+        customerMobiles: mobiles,
+        customerAddress: editWaiterAddress.trim(),
+        customerCategory: normalizeCustomerCategory(editCustomerCategory),
+        advanceAmount: advanceNum,
+        paymentMode: editBookingPaymentMode.trim(),
+        paymentTo: editBookingPaymentTo.trim(),
+      });
+      onActivitySummary?.({
+        type: 'update_booking',
+        plotNumber: plot?.plotNumber,
+        customerName: name,
+      });
+      setEditBookingOpen(false);
+      setEditBookingAdvanceAmount('');
+      setEditBookingPaymentMode('');
+      setEditBookingPaymentTo('');
+      setEditWaiterId(null);
+      setEditWaiterName('');
+      setEditWaiterMobiles(['']);
+      setEditWaiterAddress('');
+      setEditCustomerCategory('regular');
+    } catch (error) {
+      const msg = error.response?.data?.message || 'Failed to update booking details.';
+      showAlert('Error', msg);
+    } finally {
+      setIsSavingBookingEdit(false);
     }
   };
 
@@ -662,9 +1035,15 @@ const BookingModal = ({
     );
   };
 
+  /** During transfer confirm, header reflects the destination plot (tap target), not the source. */
+  const isTransferConfirm = Boolean(transferStep === 'confirm' && transferTargetPlot);
+  const headerPlot = isTransferConfirm ? transferTargetPlot : plot;
+
   const plotTitle = isBulk
     ? `Bulk Update — ${bulkCount} Plots`
-    : plot ? `Plot No. ${plot.plotNumber}` : '';
+    : headerPlot
+      ? `Plot No. ${headerPlot.plotNumber}`
+      : '';
 
   const hasBulkSelection = isBulk && selectedPlots.length > 0;
   const showOpenButton = isBulk
@@ -695,18 +1074,23 @@ const BookingModal = ({
             <View style={styles.header}>
               <View style={{ flex: 1 }}>
                 <Text style={styles.plotTitle}>{plotTitle}</Text>
-                {!isBulk && plot && (
+                {!isBulk && headerPlot && (
                   <StatusBadge
-                    status={plot.status}
-                    waiterCount={plot.waitingList ? plot.waitingList.length : 0}
+                    status={headerPlot.status}
+                    waiterCount={headerPlot.waitingList ? headerPlot.waitingList.length : 0}
                     styles={styles}
                     colors={colors}
                     isDark={isDark}
                   />
                 )}
+                {isTransferConfirm && plot ? (
+                  <Text style={styles.headerTransferFrom} numberOfLines={1}>
+                    Transferring from Plot No. {plot.plotNumber}
+                  </Text>
+                ) : null}
               </View>
               <View style={styles.headerActions}>
-                {!isBulk && plot && onPressPlotDetails && (
+                {!isBulk && plot && onPressPlotDetails && !isTransferConfirm && (
                   <TouchableOpacity
                     onPress={onPressPlotDetails}
                     style={styles.headerActionBtn}
@@ -715,7 +1099,7 @@ const BookingModal = ({
                     <Icon name="information-outline" size={22} color="#fff" />
                   </TouchableOpacity>
                 )}
-                {!isBulk && plot && (
+                {!isBulk && plot && !readOnlyGuest && !isTransferConfirm && (
                   <TouchableOpacity 
                     onPress={() => setShowHistory(!showHistory)} 
                     style={[styles.headerActionBtn, showHistory && styles.headerActionBtnActive]}
@@ -729,7 +1113,7 @@ const BookingModal = ({
               </View>
             </View>
 
-            {showHistory ? (
+            {showHistory && !readOnlyGuest ? (
               <ScrollView
                 style={[styles.bodyScroll, { maxHeight: scrollMaxHeight }]}
                 contentContainerStyle={styles.bodyContent}
@@ -746,7 +1130,9 @@ const BookingModal = ({
                   {history.length === 0 && !isLoadingHistory ? (
                     <Text style={styles.emptyHistory}>No history recorded for this plot yet.</Text>
                   ) : (
-                    history.map((item, index) => (
+                    history.map((item, index) => {
+                      const detailBlocks = getActivityHistoryDetailBlocks(item);
+                      return (
                       <View key={item._id || index} style={styles.historyItem}>
                         <View style={styles.historyDotContainer}>
                           <View style={styles.historyDot} />
@@ -805,14 +1191,22 @@ const BookingModal = ({
                               ) : null}
                             </View>
                           ) : null}
-                          {(item.action === 'Removed Waiting' || item.action === 'Removed Waiter') && item.removalRemarks ? (
-                            <Text style={styles.historyRefund}>
-                              Removal reason: {item.removalRemarks}
-                            </Text>
+                          <ActivityLogDetailPanels
+                            blocks={detailBlocks}
+                            colors={colors}
+                            isDark={isDark}
+                            dialPhone={dialPhone}
+                            itemKey={item._id != null ? String(item._id) : `h-${index}`}
+                          />
+                          {(item.action === 'Removed Waiting' || item.action === 'Removed Waiter') &&
+                          item.removalRemarks &&
+                          detailBlocks.length === 0 ? (
+                            <Text style={styles.historyRefund}>Removal reason: {item.removalRemarks}</Text>
                           ) : null}
                         </View>
                       </View>
-                    ))
+                      );
+                    })
                   )}
                   <TouchableOpacity style={styles.historyBackBtn} onPress={() => setShowHistory(false)}>
                     <Text style={styles.historyBackBtnText}>Back to Plot Details</Text>
@@ -828,8 +1222,318 @@ const BookingModal = ({
                 showsVerticalScrollIndicator
                 keyboardShouldPersistTaps="handled"
               >
+              {transferStep && !isBulk && !readOnlyGuest && !showHistory && (
+                <View
+                  style={[
+                    styles.transferPanel,
+                    { borderColor: colors.border, backgroundColor: isDark ? '#1e1033' : '#f5f3ff' },
+                  ]}
+                >
+                  <Text style={[styles.transferTitle, { color: colors.text }]}>Plot transfer</Text>
+                  <Text style={[styles.transferSubtitle, { color: colors.textSecondary }]}>
+                    {transferKind === 'booking'
+                      ? 'Move this booking to another plot.'
+                      : 'Move this waiting entry to another plot.'}
+                  </Text>
+                  {transferStep === 'target' ? (
+                    <>
+                      <Text style={[styles.transferMapPickIntro, { color: colors.textSecondary }]}>
+                        The sheet will close so you can tap the destination plot on the layout map.
+                      </Text>
+                      <TouchableOpacity
+                        style={[
+                          styles.transferMapPickBtn,
+                          { borderColor: colors.border, backgroundColor: colors.surface },
+                        ]}
+                        onPress={requestTransferTargetOnMap}
+                        disabled={!onRequestTransferTargetByMap}
+                        accessibilityRole="button"
+                        accessibilityLabel="Choose destination plot on the map"
+                      >
+                        <Icon name="map-outline" size={22} color="#7c3aed" />
+                        <Text style={styles.transferMapPickBtnText}>Choose plot on layout</Text>
+                      </TouchableOpacity>
+                      {!onRequestTransferTargetByMap ? (
+                        <Text style={[styles.transferMapPickMissing, { color: colors.textSecondary }]}>
+                          Map selection is unavailable from this screen.
+                        </Text>
+                      ) : null}
+                      <View style={styles.submitRow}>
+                        <TouchableOpacity style={styles.backBtn} onPress={cancelPlotTransfer}>
+                          <Icon name="arrow-left" size={16} color={colors.textSecondary} />
+                          <Text style={styles.backBtnText}> Cancel</Text>
+                        </TouchableOpacity>
+                      </View>
+                    </>
+                  ) : (
+                    <>
+                      <Text style={[styles.transferConfirmHint, { color: colors.textSecondary }]}>
+                        To Plot No.{' '}
+                        <Text style={{ fontWeight: '800', color: colors.text }}>
+                          {transferTargetPlot?.plotNumber}
+                        </Text>
+                        {' · From '}
+                        <Text style={{ fontWeight: '700', color: colors.text }}>{plot?.plotNumber}</Text>
+                      </Text>
+
+                      <View style={styles.fieldGroup}>
+                        <Text style={styles.fieldLabel}>
+                          Customer Name <Text style={styles.required}>*</Text>
+                        </Text>
+                        <View style={styles.inputWrapper}>
+                          <Icon
+                            name="account-outline"
+                            size={18}
+                            color={colors.textSecondary}
+                            style={styles.inputIcon}
+                          />
+                          <TextInput
+                            placeholderTextColor={colors.placeholder}
+                            style={styles.inputWithIcon}
+                            value={customerName}
+                            onChangeText={setCustomerName}
+                            placeholder="Full Name"
+                          />
+                        </View>
+                      </View>
+
+                      <View style={styles.fieldGroup}>
+                        <Text style={styles.fieldLabel}>
+                          Contact Numbers <Text style={styles.required}>*</Text>
+                        </Text>
+                        {customerMobiles.map((m, i) => (
+                          <View key={i} style={styles.mobileNumberEntry}>
+                            <View style={styles.mobileNumberHeader}>
+                              <Text style={[styles.mobileNumberLabel, { color: colors.textSecondary }]}>
+                                Mobile {i + 1}
+                              </Text>
+                              {customerMobiles.length > 1 && (
+                                <TouchableOpacity onPress={() => removeMobile(i)} style={styles.mobileRemoveBtn}>
+                                  <Icon name="minus" size={15} color="#e53935" />
+                                </TouchableOpacity>
+                              )}
+                            </View>
+                            <MobileBoxInput
+                              value={m}
+                              onChange={(t) => updateMobile(t, i)}
+                              colors={colors}
+                              isDark={isDark}
+                            />
+                          </View>
+                        ))}
+                        {customerMobiles.length < 5 && (
+                          <TouchableOpacity onPress={addMobile} style={styles.addMobileBtn}>
+                            <Icon name="plus" size={15} color={colors.primary} />
+                            <Text style={[styles.addMobileBtnText, { color: colors.primary }]}>
+                              Add number
+                            </Text>
+                          </TouchableOpacity>
+                        )}
+                      </View>
+
+                      <View style={styles.fieldGroup}>
+                        <Text style={styles.fieldLabel}>
+                          Area / Locality <Text style={styles.optional}>(Optional)</Text>
+                        </Text>
+                        <View style={styles.inputWrapper}>
+                          <Icon
+                            name="map-marker-outline"
+                            size={18}
+                            color={colors.textSecondary}
+                            style={styles.inputIcon}
+                          />
+                          <TextInput
+                            placeholderTextColor={colors.placeholder}
+                            style={styles.inputWithIcon}
+                            value={customerAddress}
+                            onChangeText={setCustomerAddress}
+                            placeholder="e.g. Block B, Sector 4"
+                          />
+                        </View>
+                      </View>
+
+                      <View style={styles.fieldGroup}>
+                        <CustomerCategoryField value={customerCategory} onChange={setCustomerCategory} />
+                      </View>
+
+                      <View style={styles.fieldGroup}>
+                        <Text style={styles.fieldLabel}>
+                          Customer Photo <Text style={styles.optional}>(Optional)</Text>
+                        </Text>
+                        <TouchableOpacity style={styles.cameraBtn} onPress={handleCamera}>
+                          {photoLocalUri ? (
+                            <Image source={{ uri: photoLocalUri }} style={styles.photoPreview} />
+                          ) : (
+                            <View style={styles.cameraPlaceholder}>
+                              <Icon name="camera-outline" size={32} color={colors.placeholder} />
+                              <Text style={styles.cameraText}>Tap to capture</Text>
+                            </View>
+                          )}
+                        </TouchableOpacity>
+                        {photoLocalUri ? (
+                          <TouchableOpacity onPress={handleCamera} style={styles.retakeBtn}>
+                            <Icon name="camera-retake-outline" size={14} color={colors.text} />
+                            <Text style={styles.retakeBtnText}> Retake Photo</Text>
+                          </TouchableOpacity>
+                        ) : null}
+                      </View>
+
+                      {transferKind === 'booking' ? (
+                        <View style={styles.paymentCard}>
+                          <View style={styles.paymentHeaderRow}>
+                            <Icon name="cash-multiple" size={18} color={colors.text} />
+                            <Text style={styles.paymentHeader}> Payment Details</Text>
+                          </View>
+                          <View style={styles.fieldGroup}>
+                            <Text style={styles.fieldLabel}>
+                              Advance / Booking Amount <Text style={styles.required}>*</Text>
+                            </Text>
+                            <View style={styles.inputWrapper}>
+                              <Text style={styles.currencySymbol}>Rs.</Text>
+                              <TextInput
+                                placeholderTextColor={colors.placeholder}
+                                style={[styles.inputWithIcon, { flex: 1 }]}
+                                value={advanceAmount}
+                                onChangeText={setAdvanceAmount}
+                                placeholder="Enter amount"
+                                keyboardType="numeric"
+                              />
+                            </View>
+                            {!advanceAmount && !adminOverrideGranted && (
+                              <TouchableOpacity
+                                onPress={() => setShowAdminOverride(!showAdminOverride)}
+                                style={styles.overrideLink}
+                              >
+                                <Icon name="shield-key-outline" size={14} color="#e53935" />
+                                <Text style={styles.overrideLinkText}> No advance? Admin override</Text>
+                              </TouchableOpacity>
+                            )}
+                            {adminOverrideGranted ? (
+                              <View style={styles.overrideGrantedRow}>
+                                <Icon name="check-circle" size={14} color="#388e3c" />
+                                <Text style={styles.overrideGranted}> Override active</Text>
+                              </View>
+                            ) : null}
+                            {showAdminOverride && !adminOverrideGranted ? (
+                              <View style={styles.overrideBox}>
+                                <Text style={styles.overrideLabel}>Admin Password</Text>
+                                <View style={styles.mobileRow}>
+                                  <TextInput
+                                    placeholderTextColor={colors.placeholder}
+                                    style={[styles.inputWithIcon, { flex: 1, marginLeft: 0 }]}
+                                    value={adminPassword}
+                                    onChangeText={setAdminPassword}
+                                    placeholder="Enter password"
+                                    secureTextEntry
+                                  />
+                                  <TouchableOpacity
+                                    onPress={checkAdminOverride}
+                                    style={[styles.mobileActionBtn, styles.mobileAddBtn]}
+                                  >
+                                    <Icon name="check" size={18} color="#fff" />
+                                  </TouchableOpacity>
+                                </View>
+                              </View>
+                            ) : null}
+                          </View>
+                          <View style={styles.fieldGroup}>
+                            <Text style={styles.fieldLabel}>
+                              Payment Mode <Text style={styles.required}>*</Text>
+                            </Text>
+                            <View style={styles.pillRow}>
+                              {PAYMENT_MODES.map((mode) => (
+                                <TouchableOpacity
+                                  key={mode}
+                                  style={[styles.pill, paymentMode === mode && styles.pillActive]}
+                                  onPress={() => {
+                                    setPaymentMode(mode);
+                                    setPaymentTo('');
+                                  }}
+                                >
+                                  <Text
+                                    style={[styles.pillText, paymentMode === mode && styles.pillTextActive]}
+                                  >
+                                    {mode}
+                                  </Text>
+                                </TouchableOpacity>
+                              ))}
+                            </View>
+                          </View>
+                          {paymentMode ? (
+                            <View style={styles.fieldGroup}>
+                              <Text style={styles.fieldLabel}>{paymentToLabel(paymentMode)}</Text>
+                              <View style={styles.inputWrapper}>
+                                <Icon
+                                  name="account-arrow-right-outline"
+                                  size={18}
+                                  color={colors.textSecondary}
+                                  style={styles.inputIcon}
+                                />
+                                <TextInput
+                                  placeholderTextColor={colors.placeholder}
+                                  style={styles.inputWithIcon}
+                                  value={paymentTo}
+                                  onChangeText={setPaymentTo}
+                                  placeholder={paymentToLabel(paymentMode)}
+                                />
+                              </View>
+                            </View>
+                          ) : null}
+                        </View>
+                      ) : null}
+
+                      <View style={styles.fieldGroup}>
+                        <Text style={styles.fieldLabel}>
+                          Extra note for destination log <Text style={styles.optional}>(Optional)</Text>
+                        </Text>
+                        <TextInput
+                          placeholderTextColor={colors.placeholder}
+                          style={[styles.inputWrapper, styles.multilineInput, { paddingHorizontal: 14 }]}
+                          value={transferExtraRemarks}
+                          onChangeText={setTransferExtraRemarks}
+                          placeholder="Appended to the automatic transfer note on the destination plot"
+                          multiline
+                          numberOfLines={3}
+                          textAlignVertical="top"
+                        />
+                      </View>
+
+                      <View style={styles.submitRow}>
+                        <TouchableOpacity
+                          style={styles.backBtn}
+                          onPress={() => {
+                            setTransferStep('target');
+                            setTransferTargetPlot(null);
+                          }}
+                        >
+                          <Icon name="arrow-left" size={16} color={colors.textSecondary} />
+                          <Text style={styles.backBtnText}> Back</Text>
+                        </TouchableOpacity>
+                        <TouchableOpacity
+                          style={[styles.submitBtn, styles.transferSubmitBtn]}
+                          onPress={submitPlotTransfer}
+                          disabled={isSubmitting || isUploading}
+                        >
+                          {isSubmitting || isUploading ? (
+                            <ActivityIndicator color="#ffffff" />
+                          ) : (
+                            <Text style={styles.submitBtnText}>Confirm transfer</Text>
+                          )}
+                        </TouchableOpacity>
+                      </View>
+                    </>
+                  )}
+                </View>
+              )}
+
               {/* BOOKED SUMMARY (same visual language as waiting-queue cards) */}
-              {!isBulk && plot && plot.status === 'booked' && plot.bookingDetails && (!activeAction || activeAction === 'refundOpen') && (() => {
+              {!isBulk &&
+                plot &&
+                plot.status === 'booked' &&
+                plot.bookingDetails &&
+                !transferStep &&
+                (!activeAction || activeAction === 'refundOpen') &&
+                (() => {
                 const bd = plot.bookingDetails;
                 const bookedMobiles = (bd.customerMobiles || []).filter((m) => String(m).trim());
                 const hasPayment =
@@ -858,7 +1562,31 @@ const BookingModal = ({
                       ) : null}
 
                       <View style={styles.queueCardInner}>
-                        <Text style={styles.queueSectionTitle}>Booked for</Text>
+                        <View style={styles.queueTopBar}>
+                          <Text style={[styles.queueSectionTitle, { marginBottom: 0, flex: 1 }]}>
+                            Booked for
+                          </Text>
+                          {!readOnlyGuest ? (
+                            <View style={styles.queueActionIcons}>
+                              <TouchableOpacity
+                                onPress={beginTransferBooking}
+                                style={styles.queueIconBtn}
+                                accessibilityRole="button"
+                                accessibilityLabel="Transfer booking to another plot"
+                              >
+                                <Icon name="swap-horizontal" size={22} color="#7c3aed" />
+                              </TouchableOpacity>
+                              <TouchableOpacity
+                                onPress={openEditBooking}
+                                style={styles.queueIconBtn}
+                                accessibilityRole="button"
+                                accessibilityLabel="Edit booking details"
+                              >
+                                <Icon name="pencil-outline" size={22} color={colors.primary} />
+                              </TouchableOpacity>
+                            </View>
+                          ) : null}
+                        </View>
 
                         <Text style={styles.queueFieldLabel}>Name</Text>
                         <Text style={styles.queueFieldValue} numberOfLines={4}>
@@ -894,14 +1622,30 @@ const BookingModal = ({
                           </>
                         ) : null}
 
-                        {bd.remarks ? (
-                          <>
-                            <Text style={[styles.queueFieldLabel, styles.queueFieldLabelSpaced]}>
-                              Notes
-                            </Text>
-                            <Text style={styles.queueFieldValue}>{bd.remarks}</Text>
-                          </>
-                        ) : null}
+                        <Text style={[styles.queueFieldLabel, styles.queueFieldLabelSpaced]}>
+                          Customer type
+                        </Text>
+                        <Text style={styles.queueFieldValue}>
+                          {labelForCustomerCategory(bd.customerCategory)}
+                        </Text>
+
+                        <View style={[styles.queueFieldLabelSpaced, { marginTop: 8 }]}>
+                          <RemarkLogSection
+                            entries={getRemarkEntries(bd)}
+                            readOnly={readOnlyGuest}
+                            disabled={false}
+                            onAdd={async (text) => {
+                              await api.post(`/${idForApiPath(plot._id)}/booking/remarks`, { text });
+                              emitNoteActivity('booking', false, bd.customerName, text);
+                            }}
+                            onPatch={async (rid, text) => {
+                              await api.patch(`/${idForApiPath(plot._id)}/booking/remarks/${rid}`, {
+                                text,
+                              });
+                              emitNoteActivity('booking', true, bd.customerName, text);
+                            }}
+                          />
+                        </View>
 
                         {hasPayment ? (
                           <View style={styles.queuePaymentHint}>
@@ -949,7 +1693,11 @@ const BookingModal = ({
               })()}
 
               {/* WAITING LIST SUMMARY (QUEUE) */}
-              {!isBulk && plot && plot.waitingList?.length > 0 && !activeAction && (
+              {!isBulk &&
+                plot &&
+                plot.waitingList?.length > 0 &&
+                !activeAction &&
+                !transferStep && (
                 <View style={styles.summaryCard}>
                   <Text style={styles.queueSectionTitle}>
                     Waiting list queue ({plot.waitingList.length})
@@ -992,23 +1740,32 @@ const BookingModal = ({
                               <Text style={styles.queueOrderText}>
                                 {toOrdinal(index + 1)} WAITING
                               </Text>
-                              <View style={styles.queueActionIcons}>
-                                <TouchableOpacity
-                                  onPress={() => openEditWaiter(waiter)}
-                                  style={styles.queueIconBtn}
-                                  accessibilityLabel="Edit waiting details"
-                                >
-                                  <Icon name="pencil-outline" size={22} color={colors.primary} />
-                                </TouchableOpacity>
-                                <TouchableOpacity
-                                  onPress={() => openRemoveWaiter(waiter._id)}
-                                  disabled={isRemoving}
-                                  style={styles.queueIconBtn}
-                                  accessibilityLabel="Remove from queue"
-                                >
-                                  <Icon name="delete-outline" size={22} color="#e53935" />
-                                </TouchableOpacity>
-                              </View>
+                              {!readOnlyGuest ? (
+                                <View style={styles.queueActionIcons}>
+                                  <TouchableOpacity
+                                    onPress={() => beginTransferWaiter(waiter._id)}
+                                    style={styles.queueIconBtn}
+                                    accessibilityLabel="Transfer this waiting entry to another plot"
+                                  >
+                                    <Icon name="swap-horizontal" size={22} color="#7c3aed" />
+                                  </TouchableOpacity>
+                                  <TouchableOpacity
+                                    onPress={() => openEditWaiter(waiter)}
+                                    style={styles.queueIconBtn}
+                                    accessibilityLabel="Edit waiting details"
+                                  >
+                                    <Icon name="pencil-outline" size={22} color={colors.primary} />
+                                  </TouchableOpacity>
+                                  <TouchableOpacity
+                                    onPress={() => openRemoveWaiter(waiter._id)}
+                                    disabled={isRemoving}
+                                    style={styles.queueIconBtn}
+                                    accessibilityLabel="Remove from queue"
+                                  >
+                                    <Icon name="delete-outline" size={22} color="#e53935" />
+                                  </TouchableOpacity>
+                                </View>
+                              ) : null}
                             </View>
 
                             <Text style={styles.queueFieldLabel}>Name</Text>
@@ -1045,14 +1802,34 @@ const BookingModal = ({
                               </>
                             ) : null}
 
-                            {waiter.remarks ? (
-                              <>
-                                <Text style={[styles.queueFieldLabel, styles.queueFieldLabelSpaced]}>
-                                  Notes
-                                </Text>
-                                <Text style={styles.queueFieldValue}>{waiter.remarks}</Text>
-                              </>
-                            ) : null}
+                            <Text style={[styles.queueFieldLabel, styles.queueFieldLabelSpaced]}>
+                              Customer type
+                            </Text>
+                            <Text style={styles.queueFieldValue}>
+                              {labelForCustomerCategory(waiter.customerCategory)}
+                            </Text>
+
+                            <View style={[styles.queueFieldLabelSpaced, { marginTop: 8 }]}>
+                              <RemarkLogSection
+                                entries={getRemarkEntries(waiter)}
+                                readOnly={readOnlyGuest}
+                                disabled={false}
+                                onAdd={async (text) => {
+                                  await api.post(
+                                    `/${idForApiPath(plot._id)}/waiting/${idForApiPath(waiter._id)}/remarks`,
+                                    { text },
+                                  );
+                                  emitNoteActivity('waiting', false, waiter.customerName, text);
+                                }}
+                                onPatch={async (rid, text) => {
+                                  await api.patch(
+                                    `/${idForApiPath(plot._id)}/waiting/${idForApiPath(waiter._id)}/remarks/${rid}`,
+                                    { text },
+                                  );
+                                  emitNoteActivity('waiting', true, waiter.customerName, text);
+                                }}
+                              />
+                            </View>
 
                             {(waiter.advanceAmount != null && waiter.advanceAmount !== '') ||
                             (waiter.paymentMode && String(waiter.paymentMode).trim()) ? (
@@ -1336,6 +2113,10 @@ const BookingModal = ({
                     </View>
                   </View>
 
+                  <View style={styles.fieldGroup}>
+                    <CustomerCategoryField value={customerCategory} onChange={setCustomerCategory} />
+                  </View>
+
                   {/* Photo */}
                   <View style={styles.fieldGroup}>
                     <Text style={styles.fieldLabel}>Customer Photo <Text style={styles.optional}>(Optional)</Text></Text>
@@ -1517,7 +2298,7 @@ const BookingModal = ({
 
               <View style={{ height: 8 }} />
             </ScrollView>
-            {!activeAction && (
+            {!activeAction && !readOnlyGuest && !transferStep && (
               <View
                 style={[
                   styles.quickActionsFooter,
@@ -1639,7 +2420,7 @@ const BookingModal = ({
     </Modal>
 
     <Modal
-      visible={Boolean(editWaiterId && plot?._id)}
+      visible={Boolean(plot?._id && (editWaiterId || editBookingOpen))}
       transparent
       animationType="fade"
       onRequestClose={closeEditWaiter}
@@ -1647,9 +2428,13 @@ const BookingModal = ({
       <View style={styles.removalOverlay}>
         <KeyboardAvoidingView behavior={keyboardAvoidingBehavior()} style={styles.removalKav}>
           <View style={[styles.removalSheet, { backgroundColor: colors.surface, borderColor: colors.border }]}>
-            <Text style={[styles.removalTitle, { color: colors.text }]}>Edit Waiting Details</Text>
+            <Text style={[styles.removalTitle, { color: colors.text }]}>
+              {editBookingOpen ? 'Edit Booking Details' : 'Edit Waiting Details'}
+            </Text>
             <Text style={[styles.removalSubtitle, { color: colors.textSecondary }]}>
-              Same layout as Add Waiting — add/remove rows for extra numbers (up to 5).
+              {editBookingOpen
+                ? 'Update customer, advance, payment, address, and notes for this booking.'
+                : 'Same layout as Add Waiting — add/remove rows for extra numbers (up to 5).'}
             </Text>
 
             <ScrollView
@@ -1666,7 +2451,7 @@ const BookingModal = ({
                   value={editWaiterName}
                   onChangeText={setEditWaiterName}
                   placeholder="Full Name"
-                  editable={!isEditingWaiter}
+                  editable={!isEditingWaiter && !isSavingBookingEdit}
                 />
               </View>
 
@@ -1681,7 +2466,7 @@ const BookingModal = ({
                       <TouchableOpacity
                         onPress={() => removeEditWaiterMobile(i)}
                         style={styles.mobileRemoveBtn}
-                        disabled={isEditingWaiter}
+                        disabled={isEditingWaiter || isSavingBookingEdit}
                       >
                         <Icon name="minus" size={15} color="#e53935" />
                       </TouchableOpacity>
@@ -1692,7 +2477,7 @@ const BookingModal = ({
                     onChange={(t) => updateEditWaiterMobile(t, i)}
                     colors={colors}
                     isDark={isDark}
-                    editable={!isEditingWaiter}
+                    editable={!isEditingWaiter && !isSavingBookingEdit}
                   />
                 </View>
               ))}
@@ -1700,7 +2485,7 @@ const BookingModal = ({
                 <TouchableOpacity
                   onPress={addEditWaiterMobile}
                   style={styles.addMobileBtn}
-                  disabled={isEditingWaiter}
+                  disabled={isEditingWaiter || isSavingBookingEdit}
                 >
                   <Icon name="plus" size={15} color={colors.primary} />
                   <Text style={[styles.addMobileBtnText, { color: colors.primary }]}>Add number</Text>
@@ -1716,38 +2501,165 @@ const BookingModal = ({
                   value={editWaiterAddress}
                   onChangeText={setEditWaiterAddress}
                   placeholder="e.g. Block B, Sector 4"
-                  editable={!isEditingWaiter}
+                  editable={!isEditingWaiter && !isSavingBookingEdit}
                 />
               </View>
 
-              <Text style={[styles.fieldLabel, { marginLeft: 0 }]}>Remarks</Text>
-              <TextInput
-                placeholderTextColor={colors.placeholder}
-                style={[styles.removalInput, { borderColor: colors.border, color: colors.text, marginBottom: 4 }]}
-                value={editWaiterRemarks}
-                onChangeText={setEditWaiterRemarks}
-                placeholder="Any comments or notes..."
-                multiline
-                numberOfLines={3}
-                textAlignVertical="top"
-                editable={!isEditingWaiter}
+              <CustomerCategoryField
+                value={editCustomerCategory}
+                onChange={setEditCustomerCategory}
+                disabled={isEditingWaiter || isSavingBookingEdit}
               />
+
+              {plot?._id && editBookingOpen && plot.bookingDetails ? (
+                <RemarkLogSection
+                  entries={getRemarkEntries(plot.bookingDetails)}
+                  readOnly={readOnlyGuest}
+                  disabled={isSavingBookingEdit}
+                  onAdd={async (text) => {
+                    await api.post(`/${idForApiPath(plot._id)}/booking/remarks`, { text });
+                    emitNoteActivity(
+                      'booking',
+                      false,
+                      plot.bookingDetails.customerName,
+                      text,
+                    );
+                  }}
+                  onPatch={async (rid, text) => {
+                    await api.patch(`/${idForApiPath(plot._id)}/booking/remarks/${rid}`, { text });
+                    emitNoteActivity(
+                      'booking',
+                      true,
+                      plot.bookingDetails.customerName,
+                      text,
+                    );
+                  }}
+                />
+              ) : null}
+              {plot?._id && editWaiterId && editingWaiterForNotes ? (
+                <RemarkLogSection
+                  entries={getRemarkEntries(editingWaiterForNotes)}
+                  readOnly={readOnlyGuest}
+                  disabled={isEditingWaiter}
+                  onAdd={async (text) => {
+                    await api.post(
+                      `/${idForApiPath(plot._id)}/waiting/${idForApiPath(editWaiterId)}/remarks`,
+                      { text },
+                    );
+                    emitNoteActivity(
+                      'waiting',
+                      false,
+                      editingWaiterForNotes.customerName,
+                      text,
+                    );
+                  }}
+                  onPatch={async (rid, text) => {
+                    await api.patch(
+                      `/${idForApiPath(plot._id)}/waiting/${idForApiPath(editWaiterId)}/remarks/${rid}`,
+                      { text },
+                    );
+                    emitNoteActivity(
+                      'waiting',
+                      true,
+                      editingWaiterForNotes.customerName,
+                      text,
+                    );
+                  }}
+                />
+              ) : null}
+
+              {editBookingOpen ? (
+                <View style={[styles.paymentCard, { marginTop: 8 }]}>
+                  <View style={styles.paymentHeaderRow}>
+                    <Icon name="cash-multiple" size={18} color={colors.text} />
+                    <Text style={styles.paymentHeader}>  Payment Details</Text>
+                  </View>
+                  <View style={styles.fieldGroup}>
+                    <Text style={styles.fieldLabel}>
+                      Advance / Booking Amount <Text style={styles.required}>*</Text>
+                    </Text>
+                    <View style={styles.inputWrapper}>
+                      <Text style={styles.currencySymbol}>Rs.</Text>
+                      <TextInput
+                        placeholderTextColor={colors.placeholder}
+                        style={[styles.inputWithIcon, { flex: 1 }]}
+                        value={editBookingAdvanceAmount}
+                        onChangeText={setEditBookingAdvanceAmount}
+                        placeholder="Enter amount (0 if none)"
+                        keyboardType="numeric"
+                        editable={!isSavingBookingEdit}
+                      />
+                    </View>
+                  </View>
+                  <View style={styles.fieldGroup}>
+                    <Text style={styles.fieldLabel}>
+                      Payment Mode <Text style={styles.required}>*</Text>
+                    </Text>
+                    <View style={styles.pillRow}>
+                      {PAYMENT_MODES.map((mode) => (
+                        <TouchableOpacity
+                          key={mode}
+                          style={[
+                            styles.pill,
+                            editBookingPaymentMode === mode && styles.pillActive,
+                          ]}
+                          onPress={() => {
+                            setEditBookingPaymentMode(mode);
+                            setEditBookingPaymentTo('');
+                          }}
+                          disabled={isSavingBookingEdit}
+                        >
+                          <Text
+                            style={[
+                              styles.pillText,
+                              editBookingPaymentMode === mode && styles.pillTextActive,
+                            ]}
+                          >
+                            {mode}
+                          </Text>
+                        </TouchableOpacity>
+                      ))}
+                    </View>
+                  </View>
+                  {editBookingPaymentMode ? (
+                    <View style={styles.fieldGroup}>
+                      <Text style={styles.fieldLabel}>{paymentToLabel(editBookingPaymentMode)}</Text>
+                      <View style={styles.inputWrapper}>
+                        <Icon
+                          name="account-arrow-right-outline"
+                          size={18}
+                          color={colors.textSecondary}
+                          style={styles.inputIcon}
+                        />
+                        <TextInput
+                          placeholderTextColor={colors.placeholder}
+                          style={styles.inputWithIcon}
+                          value={editBookingPaymentTo}
+                          onChangeText={setEditBookingPaymentTo}
+                          placeholder={paymentToLabel(editBookingPaymentMode)}
+                          editable={!isSavingBookingEdit}
+                        />
+                      </View>
+                    </View>
+                  ) : null}
+                </View>
+              ) : null}
             </ScrollView>
 
             <View style={styles.removalActions}>
               <TouchableOpacity
                 style={[styles.removalBtnCancel, { borderColor: colors.border }]}
                 onPress={closeEditWaiter}
-                disabled={isEditingWaiter}
+                disabled={isEditingWaiter || isSavingBookingEdit}
               >
                 <Text style={[styles.removalBtnCancelText, { color: colors.textSecondary }]}>Cancel</Text>
               </TouchableOpacity>
               <TouchableOpacity
                 style={styles.removalBtnSave}
-                onPress={saveEditWaiter}
-                disabled={isEditingWaiter}
+                onPress={editBookingOpen ? saveEditBooking : saveEditWaiter}
+                disabled={isEditingWaiter || isSavingBookingEdit}
               >
-                {isEditingWaiter ? (
+                {isEditingWaiter || isSavingBookingEdit ? (
                   <ActivityIndicator color="#fff" />
                 ) : (
                   <Text style={styles.removalBtnConfirmText}>Save</Text>
@@ -1792,6 +2704,13 @@ const getStyles = (colors, isDark) => StyleSheet.create({
     fontWeight: '800',
     color: '#f8fafc',
     letterSpacing: 0.3,
+  },
+  headerTransferFrom: {
+    marginTop: 6,
+    fontSize: 12,
+    fontWeight: '700',
+    color: 'rgba(248, 250, 252, 0.85)',
+    letterSpacing: 0.2,
   },
   statusBadge: {
     marginTop: 6,
@@ -2096,6 +3015,59 @@ const getStyles = (colors, isDark) => StyleSheet.create({
     marginTop: 14,
     textAlign: 'center',
     paddingHorizontal: 16,
+  },
+
+  transferPanel: {
+    borderWidth: 1.5,
+    borderRadius: 16,
+    padding: 16,
+    marginBottom: 18,
+  },
+  transferTitle: {
+    fontSize: 18,
+    fontWeight: '800',
+    marginBottom: 6,
+  },
+  transferSubtitle: {
+    fontSize: 13,
+    lineHeight: 19,
+    marginBottom: 16,
+  },
+  transferConfirmHint: {
+    fontSize: 14,
+    lineHeight: 20,
+    marginBottom: 16,
+    marginLeft: 2,
+  },
+  transferSubmitBtn: {
+    backgroundColor: '#7c3aed',
+  },
+  transferMapPickIntro: {
+    fontSize: 13,
+    lineHeight: 19,
+    marginBottom: 14,
+    marginLeft: 2,
+  },
+  transferMapPickBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 10,
+    paddingVertical: 16,
+    paddingHorizontal: 18,
+    borderRadius: 14,
+    borderWidth: 1.5,
+    marginBottom: 10,
+  },
+  transferMapPickBtnText: {
+    fontSize: 16,
+    fontWeight: '800',
+    color: '#7c3aed',
+  },
+  transferMapPickMissing: {
+    fontSize: 12,
+    marginBottom: 8,
+    marginLeft: 2,
   },
 
   removalOverlay: {

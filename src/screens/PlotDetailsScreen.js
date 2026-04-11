@@ -6,9 +6,8 @@ import {
   ScrollView,
   TouchableOpacity,
   ActivityIndicator,
-  RefreshControl,
 } from 'react-native';
-import { useNavigation, useRoute } from '@react-navigation/native';
+import { useRoute } from '@react-navigation/native';
 import { useOnAppForeground } from '../hooks/useOnAppForeground';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import Icon from 'react-native-vector-icons/MaterialIcons';
@@ -17,20 +16,19 @@ import socket from '../services/socket';
 import { useTheme } from '../context/ThemeContext';
 import { useAlert } from '../context/AlertContext';
 import { formatRupee, formatDateTime, nameOnly } from '../utils/formatting';
+import { getRemarkEntries, formatRemarkEntryAuditLines } from '../utils/remarkLog';
+import { labelForCustomerCategory } from '../utils/customerCategory';
 import UserAvatar from '../components/UserAvatar';
 import { resolveScholarPricing, resolveRegularPricing } from '../utils/pricingHelpers';
 import { STATUS_LABELS } from '../constants/statusColors';
-
-const AREA_STATEMENT_EMI_MONTHS = 36;
-
-function Row({ label, value, styles }) {
-  return (
-    <View style={styles.row}>
-      <Text style={styles.rowLabel}>{label}</Text>
-      <Text style={styles.rowValue}>{value}</Text>
-    </View>
-  );
-}
+import { usePermissions } from '../hooks/usePermissions';
+import {
+  EMI_INSTALLMENTS_LABEL,
+  PlotDetailsEmiSchedule,
+  PricingStatRow,
+  PricingStatTextRow,
+  createPlotDetailsPricingStyles,
+} from '../components/plotDetailsPricingUi';
 
 function CustomerDetailRow({ icon, label, value, styles, colors, avatarFor, avatarImageUrl }) {
   if (!value) return null;
@@ -49,18 +47,31 @@ function CustomerDetailRow({ icon, label, value, styles, colors, avatarFor, avat
 }
 
 const PlotDetailsScreen = () => {
-  const navigation = useNavigation();
   const route = useRoute();
   const { plotId } = route.params || {};
   const { colors, isDark } = useTheme();
   const { showAlert } = useAlert();
+  const { isGuest } = usePermissions();
   const insets = useSafeAreaInsets();
-  const styles = React.useMemo(() => getStyles(colors, isDark), [colors, isDark]);
+  const styles = React.useMemo(() => {
+    const shared = createPlotDetailsPricingStyles(colors, isDark);
+    const local = getStyles(colors, isDark);
+    return { ...shared, ...local };
+  }, [colors, isDark]);
 
   const [plot, setPlot] = useState(null);
   const [loading, setLoading] = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
   const [showScholarRates, setShowScholarRates] = useState(false);
+  const scrollViewportHRef = React.useRef(0);
+  const scrollContentHRef = React.useRef(0);
+  const [scrollMoreHintVisible, setScrollMoreHintVisible] = useState(false);
+  const [scrollHintDismissed, setScrollHintDismissed] = useState(false);
+
+  const recalcScrollHint = useCallback(() => {
+    const vh = scrollViewportHRef.current;
+    const ch = scrollContentHRef.current;
+    setScrollMoreHintVisible(vh > 0 && ch > vh + 24);
+  }, []);
 
   const load = useCallback(async () => {
     if (!plotId) return;
@@ -91,17 +102,9 @@ const PlotDetailsScreen = () => {
     };
   }, [plotId, load, showAlert]);
 
-  const onRefresh = useCallback(async () => {
-    if (!plotId) return;
-    try {
-      setRefreshing(true);
-      await load();
-    } catch (e) {
-      showAlert('Error', e.response?.data?.message || 'Could not refresh.');
-    } finally {
-      setRefreshing(false);
-    }
-  }, [plotId, load, showAlert]);
+  useEffect(() => {
+    setScrollHintDismissed(false);
+  }, [plotId]);
 
   useOnAppForeground(
     useCallback(() => {
@@ -125,19 +128,18 @@ const PlotDetailsScreen = () => {
     };
   }, [plotId]);
 
-  const openManage = () => {
-    if (!plot?._id) return;
-    navigation.navigate('LayoutMap', { openBookingForPlotId: plot._id });
-  };
-
   const pricing = plot?.categoryPricing || {};
   const cat = showScholarRates ? resolveScholarPricing(pricing) : resolveRegularPricing(pricing);
   const totalCost = Number(cat?.totalPlotCost);
   const advance = Number(cat?.advance);
   const balanceForEmi =
     Number.isFinite(totalCost) && Number.isFinite(advance) ? Math.max(0, totalCost - advance) : null;
-  const emiForDisplay =
-    balanceForEmi != null ? Math.round(balanceForEmi / AREA_STATEMENT_EMI_MONTHS) : cat?.emiAmount;
+  const storedEmi = cat?.emiAmount != null && !Number.isNaN(Number(cat.emiAmount)) ? Number(cat.emiAmount) : null;
+  const lastEmiAmount =
+    cat?.lastEmiAmount != null && !Number.isNaN(Number(cat.lastEmiAmount))
+      ? Number(cat.lastEmiAmount)
+      : null;
+  const emiForDisplay = storedEmi;
   const statusPill = plot ? statusPillVariant(plot.status, isDark, colors) : null;
 
   if (!plotId) {
@@ -164,30 +166,45 @@ const PlotDetailsScreen = () => {
     );
   }
 
+  const pricingCardBandStyle = showScholarRates
+    ? styles.pricingCardBandScholar
+    : styles.pricingCardBandRegular;
+  const pricingIconColor = showScholarRates ? (isDark ? '#6ee7b7' : '#047857') : isDark ? '#fcd34d' : '#b45309';
+
   return (
     <View style={[styles.screen, { backgroundColor: colors.background }]}>
-      <View style={styles.topPanel}>
-        <View style={[styles.hero, { backgroundColor: colors.surface, borderColor: colors.border }]}>
-          <View style={styles.heroTop}>
-            <Text style={styles.plotNumber}>Plot {plot.plotNumber}</Text>
-            <View style={[styles.statusPill, statusPill.container]}>
-              <Text style={[styles.statusPillText, { color: statusPill.textColor }]}>
-                {STATUS_LABELS[plot.status] || plot.status}
-              </Text>
-            </View>
+      <View
+        style={[
+          styles.fixedPlotHeader,
+          {
+            paddingTop: Math.max(insets.top, 10),
+            backgroundColor: colors.background,
+            borderBottomColor: colors.border,
+          },
+        ]}
+      >
+        <View style={styles.summaryRow}>
+          <View style={[styles.summaryCard, styles.summaryCardPlot]}>
+            <Text style={styles.summaryCardLabelPlot}>Plot number</Text>
+            <Text style={styles.summaryCardValuePlot} numberOfLines={1}>
+              {plot.plotNumber}
+            </Text>
           </View>
-          <Text style={styles.areaLine}>
-            Area:{' '}
-            {plot.areaSqFt != null && !Number.isNaN(Number(plot.areaSqFt))
-              ? `${Number(plot.areaSqFt).toLocaleString()} sq ft`
-              : '—'}
-          </Text>
+          <View style={[styles.summaryCard, styles.summaryCardArea]}>
+            <Text style={styles.summaryCardLabelArea}>AREA (in Sq. Ft.)</Text>
+            <Text style={styles.summaryCardValueArea} numberOfLines={1}>
+              {plot.areaSqFt != null && !Number.isNaN(Number(plot.areaSqFt))
+                ? Number(plot.areaSqFt).toLocaleString('en-IN')
+                : '—'}
+            </Text>
+          </View>
         </View>
 
         <View style={styles.rateBandRow}>
           <TouchableOpacity
             style={[
               styles.compactBandBtn,
+              styles.compactBandBtn40,
               !showScholarRates ? styles.compactBandBtnActiveRegular : styles.compactBandBtnInactive,
             ]}
             onPress={() => setShowScholarRates(false)}
@@ -195,67 +212,133 @@ const PlotDetailsScreen = () => {
           >
             <Icon
               name="person-outline"
-              size={16}
+              size={17}
               color={!showScholarRates ? '#0f172a' : colors.textSecondary}
             />
-            <Text style={[styles.compactBandText, !showScholarRates && styles.compactBandTextActiveOnBright]}>
+            <Text
+              style={[styles.compactBandLabel, !showScholarRates && styles.compactBandTextActiveOnBright]}
+              numberOfLines={1}
+            >
               Regular
             </Text>
           </TouchableOpacity>
           <TouchableOpacity
             style={[
               styles.compactBandBtn,
+              styles.compactBandBtn40,
               showScholarRates ? styles.compactBandBtnActiveScholar : styles.compactBandBtnInactive,
             ]}
             onPress={() => setShowScholarRates(true)}
             activeOpacity={0.9}
+            accessibilityLabel="Aalim, Hafiz, and Imam rates"
           >
             <Icon
               name="menu-book"
-              size={16}
+              size={17}
               color={showScholarRates ? '#052e16' : colors.textSecondary}
             />
-            <Text style={[styles.compactBandText, showScholarRates && styles.compactBandTextActiveOnBright]}>
-              Aalim / Hafiz / Imam
+            <Text
+              style={[styles.compactBandLabel, showScholarRates && styles.compactBandTextActiveOnBright]}
+              numberOfLines={1}
+            >
+              Aalim / Hafiz
             </Text>
           </TouchableOpacity>
-        </View>
-
-        <View style={styles.pricingGrid}>
-          <View style={[styles.compactCard, { backgroundColor: colors.surface, borderColor: colors.border }]}>
-            <View style={styles.compactCardHeader}>
-              <Icon name="calendar-view-month" size={17} color={colors.primary} />
-              <Text style={styles.compactCardTitle}> EMI Plan</Text>
-            </View>
-            <Row label="Total" value={formatRupee(cat.totalPlotCost)} styles={styles} />
-            <Row label="Advance" value={formatRupee(cat.advance)} styles={styles} />
-            <Row label="Balance for EMI" value={formatRupee(balanceForEmi)} styles={styles} />
-            <Row label="EMI" value={formatRupee(emiForDisplay)} styles={styles} />
-            <Row
-              label="Period"
-              value={`${AREA_STATEMENT_EMI_MONTHS} months`}
-              styles={styles}
-            />
-          </View>
-
-          <View style={[styles.compactCard, { backgroundColor: colors.surface, borderColor: colors.border }]}>
-            <View style={styles.compactCardHeader}>
-              <Icon name="payments" size={17} color={colors.primary} />
-              <Text style={styles.compactCardTitle}> One-time Cash</Text>
-            </View>
-            <Row label="Cash rate" value={formatRupee(cat.cashOneTimePrice)} styles={styles} />
-            <Row label="Discount" value={formatRupee(cat.cashDiscount)} styles={styles} />
+          <View style={[styles.statusPillInline, statusPill.container]}>
+            <Text
+              style={[styles.statusPillInlineText, { color: statusPill.textColor }]}
+              numberOfLines={1}
+              ellipsizeMode="tail"
+            >
+              {STATUS_LABELS[plot.status] || plot.status}
+            </Text>
           </View>
         </View>
       </View>
 
       <ScrollView
-        contentContainerStyle={styles.detailsScrollContent}
-        refreshControl={
-          <RefreshControl refreshing={refreshing} onRefresh={onRefresh} colors={[colors.primary]} />
-        }
-        showsVerticalScrollIndicator={false}
+        style={styles.detailsScroll}
+        contentContainerStyle={[
+          styles.detailsScrollContent,
+          { paddingBottom: Math.max(insets.bottom, 28) },
+        ]}
+        showsVerticalScrollIndicator
+        bounces
+        overScrollMode="always"
+        onLayout={(e) => {
+          scrollViewportHRef.current = e.nativeEvent.layout.height;
+          recalcScrollHint();
+        }}
+        onContentSizeChange={(_, h) => {
+          scrollContentHRef.current = h;
+          recalcScrollHint();
+        }}
+        onScroll={(e) => {
+          if (e.nativeEvent.contentOffset.y > 20) setScrollHintDismissed(true);
+        }}
+        scrollEventThrottle={16}
       >
+        <View style={[styles.pricingCardModern, pricingCardBandStyle]}>
+          <View style={styles.pricingCardModernHeader}>
+            <View style={[styles.pricingCardIconWrap, showScholarRates ? styles.pricingCardIconWrapScholar : styles.pricingCardIconWrapRegular]}>
+              <Icon name="calendar-view-month" size={26} color={pricingIconColor} />
+            </View>
+            <Text style={styles.pricingCardModernTitle}>EMI Plan</Text>
+          </View>
+          <PricingStatRow label="Total" amount={cat.totalPlotCost} styles={styles} />
+          <PricingStatRow label="Advance" amount={cat.advance} styles={styles} />
+          <PricingStatRow label="Balance for EMI" amount={balanceForEmi} styles={styles} />
+          <View style={styles.emiScheduleSection}>
+            <Text style={styles.emiScheduleSectionLabel}>EMI schedule</Text>
+            <View
+              style={[
+                styles.detailsEmiOuterBox,
+                showScholarRates ? styles.detailsEmiOuterBoxScholar : styles.detailsEmiOuterBoxRegular,
+              ]}
+            >
+              <PlotDetailsEmiSchedule
+                emi={emiForDisplay}
+                lastEmi={lastEmiAmount}
+                styles={styles}
+                isScholar={showScholarRates}
+              />
+            </View>
+          </View>
+          <PricingStatTextRow label="Installments" value={EMI_INSTALLMENTS_LABEL} styles={styles} isLast />
+        </View>
+
+        <View style={[styles.pricingCardModern, pricingCardBandStyle, styles.pricingCardModernSpacing]}>
+          <View style={styles.pricingCardModernHeader}>
+            <View style={[styles.pricingCardIconWrap, showScholarRates ? styles.pricingCardIconWrapScholar : styles.pricingCardIconWrapRegular]}>
+              <Icon name="payments" size={26} color={pricingIconColor} />
+            </View>
+            <Text style={styles.pricingCardModernTitle}>One-time Cash</Text>
+          </View>
+          <PricingStatRow label="Cash rate" amount={cat.cashOneTimePrice} styles={styles} />
+          <PricingStatRow label="Discount" amount={cat.cashDiscount} styles={styles} isLast />
+        </View>
+
+        {scrollMoreHintVisible && !scrollHintDismissed ? (
+          <View
+            style={[
+              styles.scrollMoreHint,
+              {
+                backgroundColor: isDark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.04)',
+                borderColor: isDark ? 'rgba(255,255,255,0.12)' : 'rgba(0,0,0,0.08)',
+              },
+            ]}
+          >
+            <Icon name="expand_more" size={22} color={colors.primary} style={styles.scrollMoreHintIcon} />
+            <Text style={[styles.scrollMoreHintText, { color: colors.textSecondary }]}>
+              {isGuest
+                ? 'Scroll to see EMI and cash pricing.'
+                : 'Scroll for more: cash summary and customer / waiting-list details.'}
+            </Text>
+          </View>
+        ) : null}
+
+        {!isGuest ? (
+          <>
         <Text style={styles.sectionTitle}>Customer Details</Text>
 
         {plot.status === 'booked' && plot.bookingDetails ? (
@@ -289,12 +372,30 @@ const PlotDetailsScreen = () => {
               colors={colors}
             />
             <CustomerDetailRow
-              icon="notes"
-              label="Remarks"
-              value={plot.bookingDetails.remarks}
+              icon="category"
+              label="Customer type"
+              value={labelForCustomerCategory(plot.bookingDetails.customerCategory)}
               styles={styles}
               colors={colors}
             />
+            {getRemarkEntries(plot.bookingDetails).length > 0 ? (
+              <View style={styles.notesBlock}>
+                <View style={styles.customerRow}>
+                  <Icon name="notes" size={16} color={colors.textSecondary} style={styles.customerRowIcon} />
+                  <Text style={styles.customerRowLabel}>Notes </Text>
+                </View>
+                {getRemarkEntries(plot.bookingDetails).map((entry, ni) => (
+                  <View key={entry._id != null ? String(entry._id) : `b-${ni}`} style={styles.noteEntry}>
+                    <Text style={[styles.customerRowValue, { marginLeft: 0 }]}>{entry.text}</Text>
+                    {formatRemarkEntryAuditLines(entry).map((line, li) => (
+                      <Text key={li} style={[styles.remarksUpdatedHint, { color: colors.textSecondary }]}>
+                        {line}
+                      </Text>
+                    ))}
+                  </View>
+                ))}
+              </View>
+            ) : null}
             <CustomerDetailRow
               icon="currency-rupee"
               label="Advance"
@@ -371,12 +472,30 @@ const PlotDetailsScreen = () => {
                   colors={colors}
                 />
                 <CustomerDetailRow
-                  icon="notes"
-                  label="Remarks"
-                  value={w.remarks}
+                  icon="category"
+                  label="Customer type"
+                  value={labelForCustomerCategory(w.customerCategory)}
                   styles={styles}
                   colors={colors}
                 />
+                {getRemarkEntries(w).length > 0 ? (
+                  <View style={styles.notesBlock}>
+                    <View style={styles.customerRow}>
+                      <Icon name="notes" size={16} color={colors.textSecondary} style={styles.customerRowIcon} />
+                      <Text style={styles.customerRowLabel}>Notes </Text>
+                    </View>
+                    {getRemarkEntries(w).map((entry, ni) => (
+                      <View key={entry._id != null ? String(entry._id) : `w-${ni}`} style={styles.noteEntry}>
+                        <Text style={[styles.customerRowValue, { marginLeft: 0 }]}>{entry.text}</Text>
+                        {formatRemarkEntryAuditLines(entry).map((line, li) => (
+                          <Text key={li} style={[styles.remarksUpdatedHint, { color: colors.textSecondary }]}>
+                            {line}
+                          </Text>
+                        ))}
+                      </View>
+                    ))}
+                  </View>
+                ) : null}
                 <CustomerDetailRow
                   icon="event"
                   label="Created"
@@ -403,25 +522,11 @@ const PlotDetailsScreen = () => {
             <Text style={styles.muted}>No waiting/booked customer details for this plot.</Text>
           </View>
         ) : null}
+          </>
+        ) : null}
 
-        <View style={{ height: 110 + insets.bottom }} />
+        <View style={styles.scrollEndSpacer} />
       </ScrollView>
-
-      <View
-        style={[
-          styles.footer,
-          {
-            paddingBottom: Math.max(insets.bottom, 14),
-            backgroundColor: colors.surface,
-            borderTopColor: colors.border,
-          },
-        ]}
-      >
-        <TouchableOpacity style={styles.manageBtn} onPress={openManage} activeOpacity={0.9}>
-          <Icon name="edit-calendar" size={22} color="#fff" />
-          <Text style={styles.manageBtnText}> Manage plot</Text>
-        </TouchableOpacity>
-      </View>
     </View>
   );
 };
@@ -453,79 +558,23 @@ const getStyles = (colors, isDark) =>
     screen: { flex: 1 },
     center: { flex: 1, justifyContent: 'center', alignItems: 'center' },
     muted: { color: colors.textSecondary, fontSize: 15 },
-    topPanel: { paddingHorizontal: 16, paddingTop: 10, paddingBottom: 8 },
-    detailsScrollContent: { paddingHorizontal: 16, paddingTop: 4 },
-    hero: {
-      borderRadius: 16,
-      padding: 14,
-      borderWidth: 1,
-      marginBottom: 10,
-    },
-    heroTop: {
+    scrollMoreHint: {
       flexDirection: 'row',
-      justifyContent: 'space-between',
       alignItems: 'center',
-      marginBottom: 10,
-    },
-    plotNumber: { fontSize: 21, fontWeight: '900', color: colors.text },
-    statusPill: { paddingHorizontal: 12, paddingVertical: 6, borderRadius: 20 },
-    statusPillText: { fontSize: 12, fontWeight: '800', color: '#0f172a' },
-    areaLine: { fontSize: 16, fontWeight: '700', color: colors.textSecondary },
-    rateBandRow: { flexDirection: 'row', gap: 8, marginBottom: 8 },
-    compactBandBtn: {
-      flex: 1,
+      gap: 10,
+      marginBottom: 14,
+      marginTop: 2,
+      paddingVertical: 12,
+      paddingHorizontal: 14,
       borderRadius: 12,
-      borderWidth: 1.5,
-      minHeight: 42,
-      paddingHorizontal: 10,
-      flexDirection: 'row',
-      alignItems: 'center',
-      justifyContent: 'center',
-      gap: 5,
+      borderWidth: 1,
     },
-    compactBandBtnInactive: {
-      backgroundColor: isDark ? '#111827' : '#f8fafc',
-      borderColor: isDark ? '#374151' : '#cbd5e1',
-    },
-    compactBandBtnActiveRegular: {
-      backgroundColor: '#facc15',
-      borderColor: '#ca8a04',
-      borderWidth: 2,
-    },
-    compactBandBtnActiveScholar: {
-      backgroundColor: '#34d399',
-      borderColor: '#059669',
-      borderWidth: 2,
-    },
-    compactBandText: {
+    scrollMoreHintIcon: { marginTop: 2 },
+    scrollMoreHintText: {
+      flex: 1,
       fontSize: 13,
-      fontWeight: '800',
-      color: colors.textSecondary,
-    },
-    compactBandTextActiveOnBright: {
-      color: '#0f172a',
-      fontWeight: '900',
-    },
-    pricingGrid: {
-      flexDirection: 'row',
-      gap: 8,
-      marginBottom: 6,
-    },
-    compactCard: {
-      flex: 1,
-      borderRadius: 12,
-      padding: 12,
-      borderWidth: 1,
-    },
-    compactCardHeader: { flexDirection: 'row', alignItems: 'center', marginBottom: 8 },
-    compactCardTitle: { fontSize: 15, fontWeight: '800', color: colors.text },
-    sectionTitle: {
-      fontSize: 14,
-      fontWeight: '800',
-      color: colors.textSecondary,
-      textTransform: 'uppercase',
-      letterSpacing: 1.2,
-      marginBottom: 8,
+      fontWeight: '600',
+      lineHeight: 19,
     },
     detailsCard: {
       borderRadius: 16,
@@ -535,22 +584,6 @@ const getStyles = (colors, isDark) =>
     },
     detailsCardHead: { flexDirection: 'row', alignItems: 'center', marginBottom: 8 },
     detailsCardTitle: { fontSize: 16, fontWeight: '800', color: colors.text },
-    row: {
-      flexDirection: 'row',
-      justifyContent: 'space-between',
-      alignItems: 'flex-start',
-      paddingVertical: 8,
-      borderBottomWidth: StyleSheet.hairlineWidth,
-      borderBottomColor: isDark ? '#3f3f46' : '#e5e7eb',
-    },
-    rowLabel: { flex: 1, fontSize: 14, color: colors.textSecondary, fontWeight: '600' },
-    rowValue: {
-      flex: 1,
-      fontSize: 14,
-      fontWeight: '800',
-      color: colors.text,
-      textAlign: 'right',
-    },
     customerRow: {
       flexDirection: 'row',
       alignItems: 'flex-start',
@@ -576,25 +609,17 @@ const getStyles = (colors, isDark) =>
       color: colors.text,
       marginBottom: 6,
     },
-    footer: {
-      position: 'absolute',
-      left: 0,
-      right: 0,
-      bottom: 0,
-      paddingHorizontal: 18,
-      paddingTop: 12,
-      borderTopWidth: 1,
+    remarksUpdatedHint: {
+      fontSize: 12,
+      fontWeight: '600',
+      fontStyle: 'italic',
+      marginTop: 4,
+      marginBottom: 2,
+      marginLeft: 0,
+      lineHeight: 17,
     },
-    manageBtn: {
-      flexDirection: 'row',
-      alignItems: 'center',
-      justifyContent: 'center',
-      gap: 8,
-      backgroundColor: colors.primary,
-      paddingVertical: 16,
-      borderRadius: 14,
-    },
-    manageBtnText: { color: '#fff', fontSize: 16, fontWeight: '800' },
+    notesBlock: { marginBottom: 8 },
+    noteEntry: { marginBottom: 12, marginLeft: 22 },
   });
 
 export default PlotDetailsScreen;

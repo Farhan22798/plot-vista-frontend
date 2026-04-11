@@ -11,3 +11,18 @@ export function getPlotFillColor(plot) {
   if (status === 'BM') return '#0ea5e9';
   return 'transparent';
 }
+
+/**
+ * Layout legend filter: which plots stay highlighted on the map.
+ * `open` = no map dimming (counts only); null = normal view.
+ */
+export function matchesLayoutStatusFilter(plot, filter) {
+  if (filter == null || filter === 'open') return true;
+  if (filter === 'booked') return plot.status === 'booked';
+  if (filter === 'waiting') return plot.status === 'waiting';
+  if (filter === 'waiting_multi') {
+    return plot.status === 'waiting' && (plot.waitingList?.length || 0) > 1;
+  }
+  if (filter === 'BM') return plot.status === 'BM';
+  return true;
+}
