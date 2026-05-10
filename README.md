@@ -1,97 +1,274 @@
-This is a new [**React Native**](https://reactnative.dev) project, bootstrapped using [`@react-native-community/cli`](https://github.com/react-native-community/cli).
+# Plot Vista — Frontend (React Native)
 
-# Getting Started
+This folder contains the **Plot Vista** mobile app: a **real-estate master plan and booking workspace** for **Golden City** (master plan map, plot lifecycle, financial views, team chat, and admin tools). It is built with **React Native** and talks to your Plot Vista **backend API**, with **CometChat** for community messaging and **Firebase Cloud Messaging** for push notifications.
 
-> **Note**: Make sure you have completed the [Set Up Your Environment](https://reactnative.dev/docs/set-up-your-environment) guide before proceeding.
+The app helps sales and operations teams see every plot on an interactive layout, manage **waiting lists** and **bookings**, track **balances** and **payments**, review **area statements**, and follow an **activity summary** of what changed across the site—optionally mirrored into CometChat notification channels.
 
-## Step 1: Start Metro
+---
 
-First, you will need to run **Metro**, the JavaScript build tool for React Native.
+## Features
 
-To start the Metro dev server, run the following command from the root of your React Native project:
+### Master plan and plots
 
-```sh
-# Using npm
+- **Interactive master plan** with pinch-to-zoom and pan; plots are drawn as polygons with status-based coloring.
+- **Plot details** with customer info, pricing (including scholar-rate views where applicable), EMI schedule UI, remark log, and status context.
+- **Bulk selection** (owner / super admin) to inspect multiple plots at once (**Selected Plots Info**).
+- **Real-time updates** via WebSocket so the map and lists stay in sync when plots change.
+- **Share / export helpers** for layout snapshots and branded location text (maps link, site copy).
+
+### Booking and plot lifecycle (owner & super admin)
+
+- **Waiting list** per plot with ordinals; **booking** flows with payment details.
+- **Status changes** such as vacant / transfer-related flows, with validation and audit-oriented messaging.
+- **Biometric confirmation** where enabled for sensitive actions.
+- **Activity summaries** pushed to CometChat groups for visibility (configurable group IDs).
+
+### Reports and operations
+
+- **Area statement** — aggregated area / allocation style reporting for the project.
+- **Waiting list** tab — cross-plot waiting visibility.
+- **Balance list** — outstanding balances and payment posture.
+- **Activity summary** — searchable, filterable, sortable log (dates, plot order, owner order) with detail panels; optional export-related workflows (spreadsheet / PDF libraries present in the app).
+
+### Accounts and roles
+
+- **Login**, **signup**, **forgot password**, and **pending approval** gate for new users.
+- **Roles**: `super_admin`, `owner`, and `guest` with a fixed capability map (edit vs read-only tabs, chat, admin).
+- **Admin panel** (super admin): list users, approve / reject signups, cycle roles.
+
+### Chat and notifications
+
+- **CometChat** (UIKit) for **group/community** chat from the layout flow, plus **message search**.
+- **Firebase** messaging hooks for **push**; local notification display on Android when configured.
+- CometChat **FCM provider ID** wired for dashboard registration.
+
+### UX
+
+- **Light / dark theme** with persisted preference.
+- **Profile** with avatar support and account maintenance modals.
+- **Server warmup** splash while the API becomes ready.
+- Optional **DEV** on-screen badge when `DEV_APP=true` in env (for non-production builds).
+
+---
+
+## Prerequisites
+
+- **Node.js** **22.11+** (see `package.json` `engines`)
+- **React Native** **0.84.x** (project version)
+- **npm** or **Yarn**
+
+**Android**
+
+- Android Studio, SDK, and an emulator or device (**Android 5.0+** typical minimum for RN; follow current RN docs for API levels)
+- **JDK** compatible with the React Native / Gradle toolchain
+
+**iOS** (macOS only)
+
+- **Xcode**
+- **CocoaPods** (via Bundler or system install)
+- Simulator or device (**iOS 12+** is often the floor for dependencies; use Xcode’s supported deployment target)
+
+**Services**
+
+- A running **Plot Vista backend** reachable from the device or emulator (correct LAN IP or HTTPS URL).
+- **CometChat** app (App ID, Region, Auth Key) and groups matching your env (defaults in code: `golden-city`, `golden-city-noti` unless overridden).
+- **Firebase** project with `google-services.json` (Android) / `GoogleService-Info.plist` (iOS) as already configured in the repo.
+
+---
+
+## Getting Started
+
+### 1. Clone the repository
+
+From the monorepo root (or your fork):
+
+```bash
+git clone <your-repo-url>
+cd PlotVista/frontend
+```
+
+### 2. Install dependencies
+
+```bash
+npm install
+```
+
+### 3. Environment variables
+
+Copy the example file and edit values for your machine and CometChat app:
+
+```bash
+cp .env.example .env
+```
+
+| Variable | Purpose |
+|----------|---------|
+| `API_URL` | Backend base URL (no trailing slash), e.g. `http://192.168.x.x:5000` for a device on the same Wi‑Fi |
+| `COMETCHAT_APP_ID` | CometChat application ID |
+| `COMETCHAT_REGION` | CometChat region |
+| `COMETCHAT_AUTH_KEY` | CometChat auth key |
+| `COMETCHAT_COMMUNITY_GROUP_ID` | Optional; overrides default community group GUID |
+| `COMETCHAT_NOTIFICATION_GROUP_ID` | Optional; overrides default notification group GUID |
+| `COMETCHAT_FCM_PROVIDER_ID` | FCM provider ID from CometChat dashboard (push) |
+
+For **release** builds, mirror the same keys in `.env.production` as used by `react-native-config`.
+
+Optional:
+
+- `DEV_APP=true` — shows a small **DEV** badge in the app (see `App.tsx`).
+
+Register and create an app in the [CometChat Dashboard](https://app.cometchat.com/) if you have not already.
+
+### 4. iOS — CocoaPods
+
+From `frontend/ios` on first clone or after native dependency changes:
+
+```bash
+bundle install   # if the project uses Bundler for CocoaPods
+cd ios
+bundle exec pod install   # or: pod install
+cd ..
+```
+
+### 5. Start Metro
+
+From `frontend`:
+
+```bash
 npm start
-
-# OR using Yarn
-yarn start
 ```
 
-## Step 2: Build and run your app
+### 6. Run the app
 
-With Metro running, open a new terminal window/pane from the root of your React Native project, and use one of the following commands to build and run your Android or iOS app:
+**Android** (new terminal, from `frontend`):
 
-### Android
-
-```sh
-# Using npm
+```bash
 npm run android
-
-# OR using Yarn
-yarn android
 ```
 
-### iOS
+The project defines **product flavors**. Examples:
 
-For iOS, remember to install CocoaPods dependencies (this only needs to be run on first clone or after updating native deps).
-
-The first time you create a new project, run the Ruby bundler to install CocoaPods itself:
-
-```sh
-bundle install
+```bash
+npm run android:dev    # dev debug variant / application id suffix
+npm run android:prod   # prod debug variant
 ```
 
-Then, and every time you update your native dependencies, run:
+**iOS**:
 
-```sh
-bundle exec pod install
-```
-
-For more information, please visit [CocoaPods Getting Started guide](https://guides.cocoapods.org/using/getting-started.html).
-
-```sh
-# Using npm
+```bash
 npm run ios
-
-# OR using Yarn
-yarn ios
 ```
 
-If everything is set up correctly, you should see your new app running in the Android Emulator, iOS Simulator, or your connected device.
+If setup is correct, the app opens in the emulator or on a connected device. For physical devices, ensure `API_URL` uses the host machine’s IP (not `localhost` from the phone’s perspective).
 
-This is one way to run your app — you can also build it directly from Android Studio or Xcode.
+---
 
-## Step 3: Modify your app
+## Screenshots
 
-Now that you have successfully run the app, let's make changes!
+Images live in **`Screenshots/`** next to this README. Current files (extensions match what is on disk):
 
-Open `App.tsx` in your text editor of choice and make some changes. When you save, your app will automatically update and reflect these changes — this is powered by [Fast Refresh](https://reactnative.dev/docs/fast-refresh).
+```
+frontend/Screenshots/
+  login.jpg
+  signup.jpg
+  pending-approval.png
+  master-plan.jpg
+  plot-details.jpg
+  multi-plot-summary.jpg
+  area-statement.jpg
+  waiting-list.jpg
+  balance-list.jpg
+  activity-summary.png
+  admin-panel.png
+  profile.jpg
+  group-chat.jpg
+  search-messages.jpg
+```
 
-When you want to forcefully reload, for example to reset the state of your app, you can perform a full reload:
+### Authentication and onboarding
 
-- **Android**: Press the <kbd>R</kbd> key twice or select **"Reload"** from the **Dev Menu**, accessed via <kbd>Ctrl</kbd> + <kbd>M</kbd> (Windows/Linux) or <kbd>Cmd ⌘</kbd> + <kbd>M</kbd> (macOS).
-- **iOS**: Press <kbd>R</kbd> in iOS Simulator.
+| Login | Sign up | Pending approval |
+|-------|---------|------------------|
+| ![Login](./Screenshots/login.jpg) | ![Sign up](./Screenshots/signup.jpg) | ![Pending approval](./Screenshots/pending-approval.png) |
 
-## Congratulations! :tada:
+### Master plan and plots
 
-You've successfully run and modified your React Native App. :partying_face:
+| Master plan (zoomed) | Plot details | Multi-plot summary |
+|----------------------|--------------|-------------------|
+| ![Master plan](./Screenshots/master-plan.jpg) | ![Plot details](./Screenshots/plot-details.jpg) | ![Multi-plot summary](./Screenshots/multi-plot-summary.jpg) |
 
-### Now what?
+### Operations
 
-- If you want to add this new React Native code to an existing application, check out the [Integration guide](https://reactnative.dev/docs/integration-with-existing-apps).
-- If you're curious to learn more about React Native, check out the [docs](https://reactnative.dev/docs/getting-started).
+| Area statement | Waiting list | Balance list |
+|----------------|--------------|--------------|
+| ![Area statement](./Screenshots/area-statement.jpg) | ![Waiting list](./Screenshots/waiting-list.jpg) | ![Balance list](./Screenshots/balance-list.jpg) |
 
-# Troubleshooting
+| Activity summary | Admin panel | Profile |
+|------------------|-------------|---------|
+| ![Activity summary](./Screenshots/activity-summary.png) | ![Admin panel](./Screenshots/admin-panel.png) | ![Profile](./Screenshots/profile.jpg) |
 
-If you're having issues getting the above steps to work, see the [Troubleshooting](https://reactnative.dev/docs/troubleshooting) page.
+### Chat
 
-# Learn More
+| Group chat | Search messages |
+|------------|-----------------|
+| ![Group chat](./Screenshots/group-chat.jpg) | ![Search messages](./Screenshots/search-messages.jpg) |
 
-To learn more about React Native, take a look at the following resources:
+**File reference**
 
-- [React Native Website](https://reactnative.dev) - learn more about React Native.
-- [Getting Started](https://reactnative.dev/docs/environment-setup) - an **overview** of React Native and how setup your environment.
-- [Learn the Basics](https://reactnative.dev/docs/getting-started) - a **guided tour** of the React Native **basics**.
-- [Blog](https://reactnative.dev/blog) - read the latest official React Native **Blog** posts.
-- [`@facebook/react-native`](https://github.com/facebook/react-native) - the Open Source; GitHub **repository** for React Native.
+1. **`login.jpg`** — Login  
+2. **`signup.jpg`** — Sign up  
+3. **`pending-approval.png`** — Pending approval  
+4. **`master-plan.jpg`** — Master plan  
+5. **`plot-details.jpg`** — Plot details  
+6. **`multi-plot-summary.jpg`** — Multi-plot summary  
+7. **`area-statement.jpg`**, **`waiting-list.jpg`**, **`balance-list.jpg`** — Area / waiting / balance  
+8. **`activity-summary.png`** — Activity summary  
+9. **`admin-panel.png`** — Admin panel  
+10. **`profile.jpg`** — Profile  
+11. **`group-chat.jpg`**, **`search-messages.jpg`** — Chat & search  
+
+If you replace a file or change its extension, update the matching `./Screenshots/...` line in the tables above.
+
+---
+
+## Tech Stack
+
+- **React Native** 0.84.x, **React** 19.x, **TypeScript** (partial) / JavaScript
+- **React Navigation** (native stack + bottom tabs)
+- **Axios** + **Socket.IO client** for API and realtime
+- **CometChat** Chat SDK + UI Kit
+- **Firebase** (app + messaging)
+- **Notifee** (local notifications)
+- **dayjs**, **react-native-config**, **AsyncStorage**, **biometrics**, image pickers, **view-shot**, **share**, **SVG**, **zoomable view**, **Excel/PDF** libraries for exports
+
+---
+
+## Scripts
+
+| Command | Description |
+|---------|-------------|
+| `npm start` | Start Metro bundler |
+| `npm run android` | Run default Android debug build |
+| `npm run android:dev` | Android dev flavor debug |
+| `npm run android:prod` | Android prod flavor debug |
+| `npm run android:release` | Example prod release assemble (Windows `gradlew.bat` in script) |
+| `npm run ios` | Run iOS build |
+| `npm test` | Jest |
+| `npm run lint` | ESLint |
+
+---
+
+## Notes
+
+- **Backend required**: Most screens need a live API; map and data load from `API_URL`.
+- **CometChat groups** must exist or match the GUIDs you set; otherwise chat init may warn or fail until the dashboard is aligned.
+- **Device networking**: Emulators use special IPs for the host machine (`10.0.2.2` on Android emulator, etc.); real devices need your LAN IP in `API_URL`.
+- This README describes the **frontend** package only; deploy and database details live with the Plot Vista backend.
+
+---
+
+## Troubleshooting
+
+- Follow the official [React Native environment setup](https://reactnative.dev/docs/set-up-your-environment) if builds fail at the toolchain level.
+- If Metro or Gradle cache causes odd errors, clean per RN/Android docs and reinstall `node_modules`.
+- For CometChat, confirm **App ID**, **region**, and **auth key** in `.env` match the CometChat app and that push **FCM** is configured if you rely on notifications.
