@@ -165,9 +165,18 @@ const LAYOUT_LEGEND = [
   { filterKey: 'waiting_multi', countKey: 'waitingMulti', color: '#f97316', label: 'Multiple Waiting', border: null },
   { filterKey: 'BM', countKey: 'bm', color: '#0ea5e9', label: 'Reserved BM', border: null },
   { filterKey: 'open', countKey: 'open', color: '#ffffff', label: 'Open', border: '#94a3b8' },
+  /** Booked plots with full advance received — same blue check marker as on the map. */
+  {
+    filterKey: 'full_advance',
+    countKey: 'fullAdvance',
+    color: '#2563eb',
+    label: 'Complete Advance Received',
+    border: null,
+    swatchKind: 'fullAdvance',
+  },
 ];
 
-const LAYOUT_LEGEND_ROWS = [LAYOUT_LEGEND.slice(0, 3), LAYOUT_LEGEND.slice(3, 5)];
+const LAYOUT_LEGEND_ROWS = [LAYOUT_LEGEND.slice(0, 3), LAYOUT_LEGEND.slice(3, 6)];
 const ADMIN_OVERRIDE_PASSWORD = '8811';
 
 const LayoutScreen = () => {
@@ -203,13 +212,22 @@ const LayoutScreen = () => {
   const [guestDisableUsePassword, setGuestDisableUsePassword] = useState(false);
   const [guestDisablePassword, setGuestDisablePassword] = useState('');
 
-  /** null | 'booked' | 'waiting' | 'waiting_multi' | 'BM' | 'open' — open = counts only, no map dimming */
+  /** null | 'booked' | 'waiting' | 'waiting_multi' | 'BM' | 'open' | 'full_advance' — open = counts only, no map dimming */
   const [mapStatusFilter, setMapStatusFilter] = useState(null);
   const [mapFilterModalVisible, setMapFilterModalVisible] = useState(false);
 
   /** Booking sheet: user chose to pick transfer destination by tapping the layout */
   const [transferMapPick, setTransferMapPick] = useState(null);
   const [pendingTransferTargetPlot, setPendingTransferTargetPlot] = useState(null);
+  /**
+   * Vacate-transfer multi-pick: while picking destinations, plots tapped here
+   * accumulate independently of the bulk-source `selectedPlots` state so the
+   * existing source list isn't corrupted while the user picks targets.
+   */
+  const [vacateTransferPickedPlots, setVacateTransferPickedPlots] = useState([]);
+  const [vacateTransferMultiPick, setVacateTransferMultiPick] = useState(false);
+  /** Array channel back to BookingModal — single-pick uses length 1, multi uses N. */
+  const [pendingTransferTargetPlots, setPendingTransferTargetPlots] = useState(null);
 
   const innerViewRef = useRef(null);
   const shareCaptureRef = useRef(null);
@@ -237,16 +255,19 @@ const LayoutScreen = () => {
     let waitingMulti = 0;
     let bm = 0;
     let open = 0;
+    let fullAdvance = 0;
     for (const p of plots) {
-      if (p.status === 'booked') booked += 1;
-      else if (p.status === 'BM') bm += 1;
+      if (p.status === 'booked') {
+        booked += 1;
+        if (p.bookingDetails?.isFullAdvanceReceived) fullAdvance += 1;
+      } else if (p.status === 'BM') bm += 1;
       else if (p.status === 'vacant') open += 1;
       else if (p.status === 'waiting') {
         waiting += 1;
         if ((p.waitingList?.length || 0) > 1) waitingMulti += 1;
       }
     }
-    return { booked, waiting, waitingMulti, bm, open };
+    return { booked, waiting, waitingMulti, bm, open, fullAdvance };
   }, [plots]);
 
   const filterBannerLine = useMemo(() => {
@@ -478,6 +499,50 @@ const LayoutScreen = () => {
       if (!clickedPlot) return;
 
       if (transferMapPick) {
+        // 'vacate-transfer' supports both single (selectedPlot) and bulk
+        // (selectedPlots) source modes, and accepts vacant / booked / waiting
+        // destinations (everything except BM and the source itself).
+        // BookingModal does the dest-list validation (no dups, slice math, etc.).
+        if (transferMapPick.kind === 'vacate-transfer') {
+          const sourceIds = new Set(
+            (selectedPlot ? [selectedPlot] : selectedPlots || [])
+              .map((p) => String(p?._id))
+              .filter(Boolean),
+          );
+          if (sourceIds.has(String(clickedPlot._id))) {
+            showAlert(
+              'Same plot',
+              'You cannot transfer a plot to itself. Pick a different destination.',
+            );
+            return;
+          }
+          if (clickedPlot.status === 'BM') {
+            showAlert(
+              'Not allowed',
+              'BM (reserved) plots cannot receive a transfer. Pick a vacant, booked, or waiting plot.',
+            );
+            return;
+          }
+          const fresh = plots.find((p) => p._id === clickedPlot._id) || clickedPlot;
+
+          // Multi-pick mode active → tap toggles instead of confirming.
+          if (vacateTransferMultiPick) {
+            setVacateTransferPickedPlots((prev) => {
+              if (prev.find((p) => String(p._id) === String(fresh._id))) {
+                return prev.filter((p) => String(p._id) !== String(fresh._id));
+              }
+              return [...prev, fresh];
+            });
+            return;
+          }
+
+          // Single-pick (legacy): confirm immediately, route through the array channel.
+          setPendingTransferTargetPlots([fresh]);
+          setTransferMapPick(null);
+          setModalVisible(true);
+          return;
+        }
+
         const source = selectedPlot;
         if (!source?._id) {
           setTransferMapPick(null);
@@ -515,6 +580,47 @@ const LayoutScreen = () => {
   };
 
   const handleLongPress = (event) => {
+    // Vacate-transfer pick: long-press starts (or extends) destination multi-pick.
+    if (transferMapPick?.kind === 'vacate-transfer') {
+      if (!canBulkSelect) return;
+      suppressNextTapRef.current = true;
+      const { pageX: tapPageX, pageY: tapPageY } = event.nativeEvent;
+      hitTestPlot(tapPageX, tapPageY, (clickedPlot) => {
+        if (!clickedPlot) {
+          suppressNextTapRef.current = false;
+          return;
+        }
+        const sourceIds = new Set(
+          (selectedPlot ? [selectedPlot] : selectedPlots || [])
+            .map((p) => String(p?._id))
+            .filter(Boolean),
+        );
+        if (sourceIds.has(String(clickedPlot._id))) {
+          showAlert(
+            'Same plot',
+            'You cannot transfer a plot to itself. Pick a different destination.',
+          );
+          return;
+        }
+        if (clickedPlot.status === 'BM') {
+          showAlert(
+            'Not allowed',
+            'BM (reserved) plots cannot receive a transfer.',
+          );
+          return;
+        }
+        const fresh = plots.find((p) => p._id === clickedPlot._id) || clickedPlot;
+        setVacateTransferMultiPick(true);
+        setVacateTransferPickedPlots((prev) => {
+          if (prev.find((p) => String(p._id) === String(fresh._id))) {
+            return prev.filter((p) => String(p._id) !== String(fresh._id));
+          }
+          return [...prev, fresh];
+        });
+      });
+      return;
+    }
+
     if (transferMapPick) return;
     if (!canBulkSelect) return;
     suppressNextTapRef.current = true;
@@ -545,7 +651,7 @@ const LayoutScreen = () => {
       const at = formatActionDateTime();
       if (isMultiSelectMode && selectedPlots.length > 0) {
         const plotIds = selectedPlots.map((p) => p._id);
-        await api.patch('/bulk', { plotIds, ...payload });
+        const bulkRes = await api.patch('/bulk', { plotIds, ...payload });
         selectedPlots.forEach((p) => {
           const waitingOrdinal =
             payload?.status === 'waiting'
@@ -553,12 +659,16 @@ const LayoutScreen = () => {
               : undefined;
           const vacCtx =
             payload?.status === 'vacant' ? deriveVacantActivityContext(p, payload) : {};
+          const pid = String(p._id);
+          const map = payload?.advanceByPlotId;
+          const advanceForMessage =
+            map && typeof map === 'object' && map[pid] != null ? map[pid] : payload?.advanceAmount;
           const msg = buildStatusActivityMessage({
             status: payload?.status,
             plotNumber: p?.plotNumber,
             customerName: payload?.customerName || vacCtx.customerName,
             waitingOrdinal,
-            advanceAmount: payload?.advanceAmount,
+            advanceAmount: advanceForMessage,
             paymentTo: payload?.paymentTo,
             paymentMode: payload?.paymentMode,
             actor,
@@ -569,6 +679,13 @@ const LayoutScreen = () => {
         });
         setSelectedPlots([]);
         setIsMultiSelectMode(false);
+        const skippedCount = Array.isArray(bulkRes?.data?.skipped) ? bulkRes.data.skipped.length : 0;
+        if (skippedCount > 0) {
+          showAlert(
+            'Bulk update partial',
+            `Updated ${bulkRes.data.updatedPlots?.length || 0} plot(s). Failed/skipped: ${skippedCount}.`,
+          );
+        }
       } else if (selectedPlot) {
         await api.patch(`/${selectedPlot._id}`, payload);
         const waitingOrdinal =
@@ -973,14 +1090,22 @@ const LayoutScreen = () => {
                   }}
                   pointerEvents="none"
                 >
-                  {plots.map((plot) => (
-                    <PlotPolygon
-                      key={plot._id}
-                      plot={plot}
-                      isSelected={selectedPlots.some((p) => p._id === plot._id)}
-                      mapStatusFilter={mapStatusFilter}
-                    />
-                  ))}
+                  {plots.map((plot) => {
+                    const isVacatePickActive =
+                      transferMapPick?.kind === 'vacate-transfer' && vacateTransferMultiPick;
+                    const isSelectedPlot = isVacatePickActive
+                      ? vacateTransferPickedPlots.some((p) => p._id === plot._id)
+                      : selectedPlots.some((p) => p._id === plot._id);
+                    return (
+                      <PlotPolygon
+                        key={plot._id}
+                        plot={plot}
+                        isSelected={isSelectedPlot}
+                        mapStatusFilter={mapStatusFilter}
+                        showFullAdvanceBadge={!isGuest && !temporaryGuestModeEnabled}
+                      />
+                    );
+                  })}
                 </Svg>
               </View>
             </View>
@@ -1019,15 +1144,23 @@ const LayoutScreen = () => {
               <View key={String(ri)} style={styles.legendCompactRow}>
                 {row.map((item) => (
                   <View key={item.filterKey} style={styles.legendCompactItem}>
-                    <View
-                      style={[
-                        styles.legendKeySwatch,
-                        { backgroundColor: item.color },
-                        item.border
-                          ? { borderColor: item.border, borderWidth: 1 }
-                          : { borderColor: isDark ? '#475569' : '#64748b', borderWidth: 1 },
-                      ]}
-                    />
+                    {item.swatchKind === 'fullAdvance' ? (
+                      <View style={styles.legendFullAdvanceSwatchOuter}>
+                        <View style={styles.legendFullAdvanceSwatch}>
+                          <Icon name="check" size={8} color="#ffffff" />
+                        </View>
+                      </View>
+                    ) : (
+                      <View
+                        style={[
+                          styles.legendKeySwatch,
+                          { backgroundColor: item.color },
+                          item.border
+                            ? { borderColor: item.border, borderWidth: 1 }
+                            : { borderColor: isDark ? '#475569' : '#64748b', borderWidth: 1 },
+                        ]}
+                      />
+                    )}
                     <Text style={styles.legendCompactLabel} numberOfLines={1}>
                       {item.label}
                     </Text>
@@ -1058,7 +1191,13 @@ const LayoutScreen = () => {
           style={[
             styles.transferMapPickBanner,
             {
-              bottom: Math.max(insets.bottom, 10) + (isMultiSelectMode && selectedPlots.length > 0 ? 72 : 8),
+              bottom:
+                Math.max(insets.bottom, 10) +
+                (transferMapPick.kind === 'vacate-transfer' && vacateTransferMultiPick
+                  ? 84
+                  : isMultiSelectMode && selectedPlots.length > 0
+                    ? 72
+                    : 8),
               borderColor: colors.border,
               backgroundColor: isDark ? '#2e1065' : '#ede9fe',
             },
@@ -1066,16 +1205,26 @@ const LayoutScreen = () => {
         >
           <View style={styles.transferMapPickBannerTextCol}>
             <Text style={[styles.transferMapPickTitle, { color: colors.text }]}>
-              Choose destination plot
+              {transferMapPick.kind === 'vacate-transfer'
+                ? vacateTransferMultiPick
+                  ? `Picking destinations (${vacateTransferPickedPlots.length})`
+                  : 'Choose where to transfer the advance'
+                : 'Choose destination plot'}
             </Text>
             <Text style={[styles.transferMapPickHint, { color: colors.textSecondary }]}>
-              Tap the plot on the map to transfer here
+              {transferMapPick.kind === 'vacate-transfer'
+                ? vacateTransferMultiPick
+                  ? 'Tap to add/remove. Long-press anywhere also adds. Use the bar below to confirm.'
+                  : 'Tap a plot to add it. Long-press to pick multiple at once.'
+                : 'Tap the plot on the map to transfer here'}
             </Text>
           </View>
           <TouchableOpacity
             style={[styles.transferMapPickCancel, { borderColor: colors.border }]}
             onPress={() => {
               setTransferMapPick(null);
+              setVacateTransferMultiPick(false);
+              setVacateTransferPickedPlots([]);
               setModalVisible(true);
             }}
             accessibilityRole="button"
@@ -1086,7 +1235,58 @@ const LayoutScreen = () => {
         </View>
       ) : null}
 
-      {isMultiSelectMode && selectedPlots.length > 0 && (
+      {transferMapPick?.kind === 'vacate-transfer' && vacateTransferMultiPick ? (
+        <View
+          style={[
+            styles.bottomBanner,
+            { backgroundColor: isDark ? '#4338ca' : '#7c3aed' },
+          ]}
+        >
+          <Text style={[styles.bannerText, { color: '#fff' }]}>
+            {vacateTransferPickedPlots.length} destination
+            {vacateTransferPickedPlots.length !== 1 ? 's' : ''} picked
+          </Text>
+          <View style={styles.bannerActions}>
+            <TouchableOpacity
+              style={[
+                styles.bannerBtn,
+                { backgroundColor: 'rgba(255,255,255,0.18)' },
+              ]}
+              onPress={() => {
+                setVacateTransferPickedPlots([]);
+                setVacateTransferMultiPick(false);
+              }}
+              accessibilityLabel="Clear destination picks"
+            >
+              <Text style={[styles.bannerBtnText, { color: '#fff' }]}>Clear</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[
+                styles.bannerBtn,
+                {
+                  backgroundColor: vacateTransferPickedPlots.length === 0 ? '#cbd5f5' : '#ffffff',
+                  opacity: vacateTransferPickedPlots.length === 0 ? 0.6 : 1,
+                },
+              ]}
+              disabled={vacateTransferPickedPlots.length === 0}
+              onPress={() => {
+                setPendingTransferTargetPlots(vacateTransferPickedPlots.slice());
+                setVacateTransferPickedPlots([]);
+                setVacateTransferMultiPick(false);
+                setTransferMapPick(null);
+                setModalVisible(true);
+              }}
+              accessibilityLabel="Add picked plots as destinations"
+            >
+              <Text style={[styles.bannerBtnText, { color: '#1f1147' }]}>
+                Add as destinations
+              </Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      ) : null}
+
+      {isMultiSelectMode && selectedPlots.length > 0 && !transferMapPick && (
         <View style={styles.bottomBanner}>
           <Text style={styles.bannerText}>
             {selectedPlots.length} plot{selectedPlots.length !== 1 ? 's' : ''}{' '}
@@ -1130,11 +1330,19 @@ const LayoutScreen = () => {
           setSelectedPlot(null);
           setTransferMapPick(null);
           setPendingTransferTargetPlot(null);
+          setPendingTransferTargetPlots(null);
+          setVacateTransferPickedPlots([]);
+          setVacateTransferMultiPick(false);
         }}
         pendingTransferTarget={pendingTransferTargetPlot}
         onConsumedPendingTransferTarget={() => setPendingTransferTargetPlot(null)}
+        pendingTransferTargetPlots={pendingTransferTargetPlots}
+        onConsumedPendingTransferTargetPlots={() => setPendingTransferTargetPlots(null)}
         onRequestTransferTargetByMap={({ kind, waitingId }) => {
           setTransferMapPick({ kind, waitingId: waitingId ?? null });
+          // Fresh pick-session always starts in single-tap mode; long-press opts in to multi.
+          setVacateTransferPickedPlots([]);
+          setVacateTransferMultiPick(false);
           setModalVisible(false);
         }}
         onPressPlotDetails={handleOpenPlotDetailsFromModal}
@@ -1272,6 +1480,7 @@ const LayoutScreen = () => {
             <Text style={[styles.filterMapModalTitle, { color: colors.text }]}>Focus map</Text>
             <Text style={[styles.filterMapModalSubtitle, { color: colors.textSecondary }]}>
               Highlight one status. Other plots fade. Open only updates the count — map colours stay the same.
+              Complete Advance Received shows booked plots that have the blue check on the map.
             </Text>
             <ScrollView
               keyboardShouldPersistTaps="handled"
@@ -1294,13 +1503,19 @@ const LayoutScreen = () => {
                       accessibilityRole="button"
                       accessibilityLabel={`${item.label}, ${count} plots${active ? ', currently selected' : ''}`}
                     >
-                      <View
-                        style={[
-                          styles.filterModalPillDot,
-                          { backgroundColor: item.color },
-                          item.border ? { borderColor: item.border, borderWidth: 1 } : null,
-                        ]}
-                      />
+                      {item.swatchKind === 'fullAdvance' ? (
+                        <View style={styles.filterModalFullAdvanceDot}>
+                          <Icon name="check" size={11} color="#ffffff" />
+                        </View>
+                      ) : (
+                        <View
+                          style={[
+                            styles.filterModalPillDot,
+                            { backgroundColor: item.color },
+                            item.border ? { borderColor: item.border, borderWidth: 1 } : null,
+                          ]}
+                        />
+                      )}
                       <Text style={[styles.filterModalPillLabel, { color: colors.text }]} numberOfLines={1}>
                         {item.label}
                       </Text>
@@ -1686,6 +1901,22 @@ function getStyles(colors, isDark) {
       height: 12,
       borderRadius: 2,
     },
+    legendFullAdvanceSwatchOuter: {
+      width: 12,
+      height: 12,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    legendFullAdvanceSwatch: {
+      width: 12,
+      height: 12,
+      borderRadius: 6,
+      backgroundColor: '#2563eb',
+      borderWidth: 1,
+      borderColor: '#ffffff',
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
     legendCompactLabel: {
       fontSize: 10,
       fontWeight: '800',
@@ -1772,6 +2003,16 @@ function getStyles(colors, isDark) {
       width: 12,
       height: 12,
       borderRadius: 6,
+    },
+    filterModalFullAdvanceDot: {
+      width: 14,
+      height: 14,
+      borderRadius: 7,
+      backgroundColor: '#2563eb',
+      borderWidth: 1,
+      borderColor: '#ffffff',
+      alignItems: 'center',
+      justifyContent: 'center',
     },
     filterModalPillLabel: {
       fontSize: 12,

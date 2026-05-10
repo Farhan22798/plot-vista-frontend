@@ -88,7 +88,12 @@ const LayoutShareCapture = forwardRef(function LayoutShareCapture(
                 style={svgStyle}
               >
                 {plots.map((plot) => (
-                  <PlotPolygon key={plot._id} plot={plot} isSelected={false} />
+                  <PlotPolygon
+                    key={plot._id}
+                    plot={plot}
+                    isSelected={false}
+                    showFullAdvanceBadge={false}
+                  />
                 ))}
               </Svg>
             )}

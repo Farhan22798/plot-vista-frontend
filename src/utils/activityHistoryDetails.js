@@ -230,6 +230,14 @@ export function buildPersonSnapshotLines(person, opts = {}) {
   if (pm) lines.push({ label: 'Payment mode', value: pm });
   const pt = String(person?.paymentTo || '').trim();
   if (pt) lines.push({ label: 'Paid to', value: pt });
+  if (person?.isFullAdvanceReceived) {
+    lines.push({ label: 'Full advance', value: 'Received' });
+    const by = nameOnly(String(person?.fullAdvanceReceivedBy || '').trim());
+    if (by && by !== '-') lines.push({ label: 'Confirmed by', value: by });
+    if (person?.fullAdvanceReceivedAt) {
+      lines.push({ label: 'Confirmed at', value: formatDateTime(person.fullAdvanceReceivedAt) });
+    }
+  }
   if (opts.extraLines?.length) lines.push(...opts.extraLines);
   return lines;
 }
@@ -383,6 +391,33 @@ export function getActivityHistoryDetailBlocks(item) {
       { label: 'Saved by', value: savedBy, changed: false },
     ];
     blocks.push({ title: 'What changed', lines: linesOut });
+    return blocks;
+  }
+
+  if (
+    (action === 'Marked Full Advance Received' || action === 'Unmarked Full Advance Received') &&
+    next.bookingDetails
+  ) {
+    const bd = next.bookingDetails;
+    const isReceived = Boolean(bd.isFullAdvanceReceived);
+    const amount = bd.advanceAmount != null && !Number.isNaN(Number(bd.advanceAmount))
+      ? `Rs. ${Number(bd.advanceAmount).toLocaleString()}`
+      : 'No Advance Value Known : Error';
+    const by = nameOnly(String(bd.fullAdvanceReceivedBy || item.changedBy || '').trim()) || '—';
+    const at = bd.fullAdvanceReceivedAt ? formatDateTime(bd.fullAdvanceReceivedAt) : '—';
+    blocks.push({
+      title: 'Full advance status',
+      lines: [
+        { label: 'Status', value: isReceived ? 'Received' : 'Not marked', changed: true },
+        { label: 'Advance amount', value: amount, changed: false },
+        ...(isReceived
+          ? [
+              { label: 'Confirmed by', value: by, changed: false },
+              { label: 'Confirmed at', value: at, changed: false },
+            ]
+          : []),
+      ],
+    });
     return blocks;
   }
 

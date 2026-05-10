@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useContext } from 'react';
 import {
   Modal, View, Text, TextInput, TouchableOpacity, ScrollView,
   StyleSheet, Image, Alert, ActivityIndicator, KeyboardAvoidingView, Platform,
@@ -27,12 +27,56 @@ import { normalizeCustomerCategory, labelForCustomerCategory } from '../utils/cu
 import { idForApiPath } from '../utils/mongoId';
 import { getTransferTargetValidationError } from '../utils/transferTargetValidation';
 import { useAlert } from '../context/AlertContext';
+import { AuthContext } from '../context/AuthContext';
 import { useTheme } from '../context/ThemeContext';
+import RecordPaymentMarkCompleteModal from './RecordPaymentMarkCompleteModal';
+import {
+  balanceListRowFromBookedPlot,
+  buildBalanceClearedRemark,
+  buildBookingPatchBodyFromRow,
+  expectedAdvanceForPlot,
+  validateRecordPaymentPartial,
+  validateRecordPaymentCompleteAdvance,
+} from '../utils/bookingRecordPayment';
 import { keyboardAvoidingBehavior } from '../utils/keyboardAvoiding';
+import Clipboard from '@react-native-clipboard/clipboard';
+import { Buffer } from 'buffer';
+import { resolveRegularPricing, resolveScholarPricing } from '../utils/pricingHelpers';
 
 const PAYMENT_MODES = ['Cash', 'Cheque', 'UPI', 'Bank Transfer'];
 const REFUND_MODES = PAYMENT_MODES;
 const ADMIN_PASSWORD = '8811';
+
+/** Split total rupees across plots using paise so the parts sum exactly to the total. */
+function splitAdvanceTotalEvenly(totalRaw, plots) {
+  const total = Number(String(totalRaw ?? '').replace(/,/g, ''));
+  if (Number.isNaN(total) || total < 0 || !Array.isArray(plots) || plots.length === 0) return null;
+  const n = plots.length;
+  const totalPaise = Math.round(total * 100);
+  const base = Math.floor(totalPaise / n);
+  const rem = totalPaise - base * n;
+  return plots.map((p, i) => {
+    const paise = base + (i < rem ? 1 : 0);
+    return {
+      plotId: String(p._id),
+      plotNumber: String(p?.plotNumber ?? '').trim() || '—',
+      advanceAmount: paise / 100,
+    };
+  });
+}
+
+function buildBulkEqualSplitRemarkLines(totalRaw, splits, formatRupee) {
+  const total = Number(String(totalRaw ?? '').replace(/,/g, ''));
+  if (Number.isNaN(total) || !splits?.length) return '';
+  let out = `Total advance received: ${formatRupee(total)}\nAdvance for\n`;
+  splits.forEach((s) => {
+    out += `Plot No. ${s.plotNumber} = ${formatRupee(s.advanceAmount)}\n`;
+  });
+  return out.trimEnd();
+}
+
+/** Checkbox label: booking / edit booking — full advance flag. */
+const COMPLETE_ADVANCE_RECEIVED_LABEL = 'Complete Advance Received';
 
 const paymentToLabel = (mode) => {
   if (mode === 'Cash') return 'Owner Name (Received By)';
@@ -41,6 +85,174 @@ const paymentToLabel = (mode) => {
   if (mode === 'Bank Transfer') return 'Bank Name & Account';
   return 'Received By';
 };
+
+const CLIPBOARD_CUSTOMER_KIND = 'plotvista-customer';
+const CLIPBOARD_CUSTOMER_VERSION = 1;
+
+function buildClipboardPayloadFromWaiter(waiter) {
+  const mobiles = Array.isArray(waiter?.customerMobiles)
+    ? waiter.customerMobiles.map((m) => String(m).trim()).filter(Boolean)
+    : [];
+  return {
+    v: CLIPBOARD_CUSTOMER_VERSION,
+    kind: CLIPBOARD_CUSTOMER_KIND,
+    source: 'waiting',
+    customerName: String(waiter?.customerName || '').trim(),
+    customerMobiles: mobiles,
+    customerAddress: String(waiter?.customerAddress || '').trim(),
+    customerCategory: normalizeCustomerCategory(waiter?.customerCategory),
+    customerPhoto: String(waiter?.customerPhoto || '').trim(),
+    remarks: joinRemarkTexts(waiter).trim(),
+    booking: null,
+  };
+}
+
+function buildClipboardPayloadFromBooking(bd) {
+  const mobiles = Array.isArray(bd?.customerMobiles)
+    ? bd.customerMobiles.map((m) => String(m).trim()).filter(Boolean)
+    : [];
+  return {
+    v: CLIPBOARD_CUSTOMER_VERSION,
+    kind: CLIPBOARD_CUSTOMER_KIND,
+    source: 'booked',
+    customerName: String(bd?.customerName || '').trim(),
+    customerMobiles: mobiles,
+    customerAddress: String(bd?.customerAddress || '').trim(),
+    customerCategory: normalizeCustomerCategory(bd?.customerCategory),
+    customerPhoto: String(bd?.customerPhoto || '').trim(),
+    remarks: joinRemarkTexts(bd).trim(),
+    /** Never copy advance / payment / mode — those are always plot-specific and must be entered fresh. */
+    booking: null,
+  };
+}
+
+function parsePlotVistaCustomerClipboard(text) {
+  if (!text || typeof text !== 'string') return null;
+  let data;
+  try {
+    data = JSON.parse(text.trim());
+  } catch {
+    return null;
+  }
+  if (data?.kind !== CLIPBOARD_CUSTOMER_KIND || data.v !== CLIPBOARD_CUSTOMER_VERSION) {
+    return null;
+  }
+  return data;
+}
+
+/** Keep embedded image small so the clipboard JSON stays within typical OS limits. */
+const CLIPBOARD_PHOTO_MAX_BYTES = 650_000;
+const CLIPBOARD_JSON_MAX_CHARS = 1_600_000;
+
+async function tryFetchImageAsBase64(url) {
+  const u = String(url || '').trim();
+  if (!u || !/^https?:\/\//i.test(u)) return null;
+  try {
+    const res = await fetch(u);
+    if (!res.ok) return null;
+    const buf = await res.arrayBuffer();
+    if (!buf || buf.byteLength > CLIPBOARD_PHOTO_MAX_BYTES) return null;
+    const b64 = Buffer.from(new Uint8Array(buf)).toString('base64');
+    const ct = res.headers.get('content-type') || '';
+    const mimeMatch = /^image\/[\w.+-]+/i.exec(ct || '');
+    const mime = mimeMatch ? mimeMatch[0].toLowerCase() : 'image/jpeg';
+    return { base64: b64, mime };
+  } catch {
+    return null;
+  }
+}
+
+function stripEmbeddedPhotoFromPayload(payload) {
+  if (!payload || typeof payload !== 'object') return payload;
+  const next = { ...payload };
+  delete next.photoBase64;
+  delete next.photoMime;
+  return next;
+}
+
+async function attachPhotoBase64ToPayload(payload) {
+  if (!payload || typeof payload !== 'object') return payload;
+  if (String(payload.photoBase64 || '').trim()) return payload;
+  const url = String(payload.customerPhoto || '').trim();
+  if (!url || !/^https?:\/\//i.test(url)) return payload;
+  const got = await tryFetchImageAsBase64(url);
+  if (!got) return payload;
+  return { ...payload, photoBase64: got.base64, photoMime: got.mime };
+}
+
+/**
+ * @returns {Promise<{ json: string; embeddedPhoto: boolean; photoDroppedForSize: boolean; hadPhotoUrl: boolean }>}
+ */
+async function writeCustomerPayloadToClipboard(basePayload) {
+  const hadPhotoUrl = /^https?:\/\//i.test(String(basePayload.customerPhoto || '').trim());
+  let p = await attachPhotoBase64ToPayload({ ...basePayload });
+  let embeddedPhoto = Boolean(p.photoBase64);
+  let json = JSON.stringify(p);
+  let photoDroppedForSize = false;
+  if (json.length > CLIPBOARD_JSON_MAX_CHARS && p.photoBase64) {
+    p = stripEmbeddedPhotoFromPayload(p);
+    json = JSON.stringify(p);
+    embeddedPhoto = false;
+    photoDroppedForSize = true;
+  }
+  return { json, embeddedPhoto, photoDroppedForSize, hadPhotoUrl };
+}
+
+function buildCopySuccessMessage(meta) {
+  const base =
+    'Customer details are on the clipboard (not advance or payment — enter those manually for each plot). Open Add Waiting, booking, or Edit, then tap “Paste customer details.” You can change any field before saving.';
+  if (meta.embeddedPhoto) {
+    return `${base} The photo is included and will upload when you save this entry.`;
+  }
+  if (meta.photoDroppedForSize && meta.hadPhotoUrl) {
+    return `${base} The photo file was too large to embed. The link is still included. If the image does not appear, add the photo again.`;
+  }
+  if (meta.hadPhotoUrl) {
+    return `${base} A link to the photo is included. If the image does not appear after pasting, add the photo again.`;
+  }
+  return base;
+}
+
+/** Same source as Plot Details / Multi-plot summary: `categoryPricing.regular.advance`. */
+function getRegularCategoryAdvance(plot) {
+  if (!plot) return null;
+  const cat = resolveRegularPricing(plot.categoryPricing);
+  const adv = cat?.advance;
+  if (adv == null || adv === '') return null;
+  const n = Number(adv);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** `categoryPricing.scholar` (or legacy aalim/hafiz/imam). */
+function getScholarCategoryAdvance(plot) {
+  if (!plot) return null;
+  const cat = resolveScholarPricing(plot.categoryPricing);
+  const adv = cat?.advance;
+  if (adv == null || adv === '') return null;
+  const n = Number(adv);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * One row for “expected advance” copy: Alim/Hafiz uses scholar advance on exactly one plot in bulk;
+ * all other plots use regular. Same as MultiPlotSummaryScreen scholar toggle.
+ */
+function getExpectedBookingAdvanceRow(plot, { isScholarCustomer, scholarDiscountPlotId }) {
+  const plotNumber = String(plot?.plotNumber ?? '').trim() || '—';
+  const pid = String(plot?._id ?? '');
+  const useScholar =
+    isScholarCustomer && scholarDiscountPlotId && pid === String(scholarDiscountPlotId);
+  if (useScholar) {
+    const s = getScholarCategoryAdvance(plot);
+    if (s != null) return { plotNumber, expected: s, rateLabel: 'Alim / Hafiz' };
+  }
+  const r = getRegularCategoryAdvance(plot);
+  return {
+    plotNumber,
+    expected: r,
+    rateLabel: 'Regular',
+  };
+}
 
 const StatusBadge = ({ status, waiterCount, styles, colors, isDark }) => {
   const isVacant = status === 'vacant';
@@ -76,6 +288,12 @@ const BookingModal = ({
   /** LayoutScreen: plot user tapped as transfer destination (consumed when applied). */
   pendingTransferTarget = null,
   onConsumedPendingTransferTarget,
+  /**
+   * LayoutScreen (vacate-transfer multi-pick): array of plots picked from the map
+   * to be appended as destinations. Single-pick also routes here as a 1-element array.
+   */
+  pendingTransferTargetPlots = null,
+  onConsumedPendingTransferTargetPlots,
   /** Ask parent to hide sheet and enter “tap plot on map” mode. */
   onRequestTransferTargetByMap,
 }) => {
@@ -90,6 +308,7 @@ const BookingModal = ({
     Math.max(200, sheetMaxHeight - 108 - 128 - Math.max(insets.bottom, 0)),
   );
   const { showAlert } = useAlert();
+  const { userInfo } = useContext(AuthContext);
   const [activeAction, setActiveAction] = useState(null);
   /** When booking while waiters exist: set after "Book as …" or per-row "Make final" so submit is allowed. */
   const bookedFlowSourceRef = useRef(null);
@@ -128,6 +347,11 @@ const BookingModal = ({
   const [editBookingAdvanceAmount, setEditBookingAdvanceAmount] = useState('');
   const [editBookingPaymentMode, setEditBookingPaymentMode] = useState('');
   const [editBookingPaymentTo, setEditBookingPaymentTo] = useState('');
+  const [fullAdvanceReceived, setFullAdvanceReceived] = useState(false);
+  const [recordPaymentModalVisible, setRecordPaymentModalVisible] = useState(false);
+  const [recordPaymentSummaryRow, setRecordPaymentSummaryRow] = useState(null);
+  const [recordPaymentSubmitting, setRecordPaymentSubmitting] = useState(false);
+  const [recordPaymentSubmittingAction, setRecordPaymentSubmittingAction] = useState(null);
   const [editWaiterId, setEditWaiterId] = useState(null);
   const [editWaiterName, setEditWaiterName] = useState('');
   const [editWaiterMobiles, setEditWaiterMobiles] = useState(['']);
@@ -146,6 +370,35 @@ const BookingModal = ({
   const [transferWaitingId, setTransferWaitingId] = useState(null);
   const [transferTargetPlot, setTransferTargetPlot] = useState(null);
   const [transferExtraRemarks, setTransferExtraRemarks] = useState('');
+
+  /**
+   * Mark-Open + (optional) refund + (optional) transfer destinations.
+   * Each destination: { tempId, plotId, plot, customerForm? }.
+   * `customerForm` is populated only for vacant destinations.
+   * Slices are derived (equal split of `transferableTotal`); not stored in state.
+   */
+  const [vacateTransferDestinations, setVacateTransferDestinations] = useState([]);
+  /** True while the user is on the map picking destinations for the vacate-transfer flow. */
+  const [awaitingVacateTransferPick, setAwaitingVacateTransferPick] = useState(false);
+  const [isSubmittingTransferAndVacate, setIsSubmittingTransferAndVacate] = useState(false);
+
+  /**
+   * Mark-Open mode picker. Shown when the user starts the OPEN flow on a booked plot
+   * (i.e. money needs to be accounted for). Forces an explicit choice between:
+   *   - 'refund'   : refund only, no transfer (existing standard refund flow).
+   *   - 'transfer' : full received amount transferred, no refund.
+   *   - 'both'     : partial refund + remainder transferred.
+   * Empty string = nothing picked yet → submit is blocked.
+   */
+  const [vacateMode, setVacateMode] = useState('');
+  /** Y position of the refund/transfer section inside the body ScrollView (set via onLayout). */
+  const [refundSectionY, setRefundSectionY] = useState(null);
+  /** Ref to the body ScrollView so we can scroll the refund/transfer section into view. */
+  const bodyScrollRef = useRef(null);
+
+  /** Bulk book + Alim/Hafiz: scholar pricing applies to this plot id only (same rule as Multi Plot Summary). */
+  const [scholarDiscountPlotId, setScholarDiscountPlotId] = useState(null);
+  const [scholarPlotPickerVisible, setScholarPlotPickerVisible] = useState(false);
 
   // Reset only when the target plot or bulk mode changes — not when the modal is hidden
   // to view Plot details (so back returns to the same step: quick actions, forms, history).
@@ -183,6 +436,11 @@ const BookingModal = ({
     setEditBookingAdvanceAmount('');
     setEditBookingPaymentMode('');
     setEditBookingPaymentTo('');
+    setFullAdvanceReceived(false);
+    setRecordPaymentModalVisible(false);
+    setRecordPaymentSummaryRow(null);
+    setRecordPaymentSubmitting(false);
+    setRecordPaymentSubmittingAction(null);
     setEditWaiterId(null);
     setEditWaiterName('');
     setEditWaiterMobiles(['']);
@@ -198,11 +456,65 @@ const BookingModal = ({
     setTransferWaitingId(null);
     setTransferTargetPlot(null);
     setTransferExtraRemarks('');
+    setVacateTransferDestinations([]);
+    setAwaitingVacateTransferPick(false);
+    setIsSubmittingTransferAndVacate(false);
+    setVacateMode('');
+    setRefundSectionY(null);
+    setScholarDiscountPlotId(null);
+    setScholarPlotPickerVisible(false);
   }, [plot?._id, isBulk]);
+
+  useEffect(() => {
+    if (activeAction !== 'booked' || !isBulk) {
+      setScholarDiscountPlotId(null);
+      setScholarPlotPickerVisible(false);
+      return;
+    }
+    if (normalizeCustomerCategory(customerCategory) !== 'scholar') {
+      setScholarDiscountPlotId(null);
+      return;
+    }
+    if (!selectedPlots.length) return;
+    if (selectedPlots.length === 1) {
+      setScholarDiscountPlotId(String(selectedPlots[0]._id));
+      return;
+    }
+    setScholarDiscountPlotId((prev) => {
+      const idSet = new Set(selectedPlots.map((p) => String(p._id)));
+      const p = prev && idSet.has(String(prev)) ? String(prev) : null;
+      if (p) return p;
+      const sorted = [...selectedPlots].sort((a, b) =>
+        String(a.plotNumber).localeCompare(String(b.plotNumber), undefined, { numeric: true }),
+      );
+      return String(sorted[0]._id);
+    });
+  }, [activeAction, isBulk, selectedPlots, customerCategory]);
 
   useEffect(() => {
     if (activeAction !== 'booked') {
       bookedFlowSourceRef.current = null;
+    }
+  }, [activeAction]);
+
+  // When the OPEN-with-refund step appears, scroll the body so the section
+  // header (and the new mode picker right under it) is visible. Without this
+  // the user lands at the bottom of the prior actions and can't see the new
+  // refund/transfer fields without manually scrolling.
+  useEffect(() => {
+    if (activeAction !== 'refundOpen') return;
+    if (refundSectionY == null) return;
+    const ref = bodyScrollRef.current;
+    if (!ref || typeof ref.scrollTo !== 'function') return;
+    ref.scrollTo({ y: Math.max(0, refundSectionY - 8), animated: true });
+  }, [activeAction, refundSectionY]);
+
+  // Reset the section position whenever we leave the OPEN-with-refund step,
+  // so the next entry re-measures (modal contents above can change height).
+  useEffect(() => {
+    if (activeAction !== 'refundOpen') {
+      setRefundSectionY(null);
+      setVacateMode('');
     }
   }, [activeAction]);
 
@@ -245,6 +557,115 @@ const BookingModal = ({
       });
     },
     [onActivitySummary, plot?.plotNumber],
+  );
+
+  const closeRecordPaymentModal = useCallback(() => {
+    setRecordPaymentModalVisible(false);
+    setRecordPaymentSummaryRow(null);
+    setRecordPaymentSubmittingAction(null);
+  }, []);
+
+  const openRecordPaymentFromSummary = useCallback(() => {
+    if (!plot?._id || !plot.bookingDetails || readOnlyGuest) return;
+    const row = balanceListRowFromBookedPlot(plot);
+    const bd = row.bd;
+    if (bd.isFullAdvanceReceived) return;
+    const name = (bd.customerName || '').trim();
+    if (!name) {
+      showAlert('Cannot mark', 'This booking has no customer name. Update booking details first.');
+      return;
+    }
+    const mobiles = (bd.customerMobiles || []).map((m) => String(m).trim()).filter(Boolean);
+    if (!mobiles.length) {
+      showAlert('Cannot mark', 'Add at least one mobile number in booking details first.');
+      return;
+    }
+    if (row.amountPaid == null) {
+      showAlert('Cannot mark', 'No amount paid is recorded. Enter the advance received in booking details first.');
+      return;
+    }
+    setRecordPaymentSummaryRow(row);
+    setRecordPaymentModalVisible(true);
+  }, [plot, readOnlyGuest, showAlert]);
+
+  const submitRecordPaymentFromModal = useCallback(
+    async (form) => {
+      if (!plot?._id || !plot.bookingDetails || !recordPaymentSummaryRow) return;
+      const row = recordPaymentSummaryRow;
+      const action = form.action;
+      if (action !== 'partial' && action !== 'complete') return;
+      const v =
+        action === 'partial'
+          ? validateRecordPaymentPartial(row, form, showAlert)
+          : validateRecordPaymentCompleteAdvance(row, form, showAlert);
+      if (!v) return;
+
+      const actorLabel = String(userInfo?.name || userInfo?.mobileNumber || 'User').trim();
+      const recordedAt = formatDateTimeShared(new Date());
+      const bookedAt = row.bd?.createdAt ? new Date(row.bd.createdAt) : null;
+      const bookingRecordedAtLabel =
+        bookedAt && !Number.isNaN(bookedAt.getTime()) ? formatDateTimeShared(bookedAt) : '—';
+      const remarkText = buildBalanceClearedRemark({
+        row,
+        actorLabel,
+        recordedAt,
+        paymentMode: v.paymentMode,
+        paymentTo: v.paymentTo,
+        thisPaymentAmount: v.thisPay,
+        newAdvanceAmount: v.newAdvance,
+        bookingRecordedAtLabel,
+        extraNote: form.extraNote,
+        headline: action === 'partial' ? 'Partial payment' : undefined,
+      });
+
+      const pid = idForApiPath(plot._id);
+      setRecordPaymentSubmitting(true);
+      setRecordPaymentSubmittingAction(action);
+      try {
+        const patchBody = buildBookingPatchBodyFromRow(row, {
+          isFullAdvanceReceived: action === 'complete',
+          advanceAmount: v.newAdvance,
+          paymentMode: v.paymentMode,
+          paymentTo: v.paymentTo,
+        });
+        const patchRes = await api.patch(`/${pid}/booking`, patchBody);
+        const plotAfter = patchRes.data?.plot ?? patchRes.data;
+        if (!plotAfter?._id) {
+          showAlert('Error', 'Unexpected response from server.');
+          return;
+        }
+        try {
+          await api.post(`/${pid}/booking/remarks`, { text: remarkText });
+          emitNoteActivity('booking', false, row.bd.customerName, remarkText.slice(0, 220));
+        } catch (re) {
+          showAlert(
+            'Booking updated',
+            `${action === 'complete' ? 'Advance marked complete' : 'Payment recorded'}, but the automatic note could not be saved: ${re.response?.data?.message || re.message || 'Unknown error'}. Add a remark manually if needed.`,
+          );
+        }
+        onActivitySummary?.({
+          type: 'update_booking',
+          plotNumber: plot?.plotNumber,
+          customerName: row.bd.customerName || '',
+        });
+        closeRecordPaymentModal();
+      } catch (e) {
+        showAlert('Error', e.response?.data?.message || 'Could not update booking.');
+      } finally {
+        setRecordPaymentSubmitting(false);
+        setRecordPaymentSubmittingAction(null);
+      }
+    },
+    [
+      plot,
+      recordPaymentSummaryRow,
+      showAlert,
+      userInfo?.mobileNumber,
+      userInfo?.name,
+      emitNoteActivity,
+      onActivitySummary,
+      closeRecordPaymentModal,
+    ],
   );
 
   const cancelPlotTransfer = useCallback(() => {
@@ -550,6 +971,7 @@ const BookingModal = ({
       setAdvanceAmount('');
       setPaymentMode('');
       setPaymentTo('');
+      setFullAdvanceReceived(false);
       setAdminOverrideGranted(false);
       setShowAdminOverride(false);
       setAdminPassword('');
@@ -571,6 +993,7 @@ const BookingModal = ({
     setAdvanceAmount('');
     setPaymentMode('');
     setPaymentTo('');
+    setFullAdvanceReceived(false);
     setAdminOverrideGranted(false);
     setShowAdminOverride(false);
     setAdminPassword('');
@@ -579,6 +1002,13 @@ const BookingModal = ({
 
   const onPressFinal = useCallback(() => {
     if (isBulk) {
+      if (selectedPlots.some((p) => p.status === 'waiting')) {
+        showAlert(
+          'Final booking unavailable',
+          'One or more selected plots already have waiting entries. Remove waiting or update plots separately — bulk final booking is not available.',
+        );
+        return;
+      }
       openFreshBookedForm();
       return;
     }
@@ -603,7 +1033,7 @@ const BookingModal = ({
       ],
       { verticalButtons: true }
     );
-  }, [isBulk, plot?.waitingList, showAlert, applyWaiterToBookingForm, openFreshBookedForm]);
+  }, [isBulk, plot?.waitingList, selectedPlots, showAlert, applyWaiterToBookingForm, openFreshBookedForm]);
 
   const checkAdminOverride = () => {
     if (adminPassword === ADMIN_PASSWORD) {
@@ -612,6 +1042,140 @@ const BookingModal = ({
       showAlert('Override Granted', 'You can now book without an advance amount.');
     } else {
       showAlert('Wrong Password', 'Admin password is incorrect.');
+    }
+  };
+
+  const copyWaiterCustomerToClipboard = async (waiter) => {
+    try {
+      const { json, embeddedPhoto, photoDroppedForSize, hadPhotoUrl } =
+        await writeCustomerPayloadToClipboard(buildClipboardPayloadFromWaiter(waiter));
+      await Clipboard.setString(json);
+      showAlert(
+        'Copied to clipboard',
+        buildCopySuccessMessage({ embeddedPhoto, photoDroppedForSize, hadPhotoUrl }),
+      );
+    } catch {
+      showAlert('Could not copy', 'Something went wrong while copying. Please try again.');
+    }
+  };
+
+  const copyBookingCustomerToClipboard = async (bd) => {
+    try {
+      const { json, embeddedPhoto, photoDroppedForSize, hadPhotoUrl } =
+        await writeCustomerPayloadToClipboard(buildClipboardPayloadFromBooking(bd));
+      await Clipboard.setString(json);
+      showAlert(
+        'Copied to clipboard',
+        buildCopySuccessMessage({ embeddedPhoto, photoDroppedForSize, hadPhotoUrl }),
+      );
+    } catch {
+      showAlert('Could not copy', 'Something went wrong while copying. Please try again.');
+    }
+  };
+
+  const pasteCustomerIntoAddForm = async () => {
+    if (readOnlyGuest || (activeAction !== 'waiting' && activeAction !== 'booked')) return;
+    try {
+      const raw = await Clipboard.getString();
+      const payload = parsePlotVistaCustomerClipboard(raw);
+      if (!payload) {
+        showAlert(
+          'Nothing to paste',
+          'The clipboard does not contain PlotVista customer details. Use Copy on a waiting or booked entry first.',
+        );
+        return;
+      }
+      const pastedRemarks = String(payload.remarks || '').trim();
+      const mobiles = Array.isArray(payload.customerMobiles)
+        ? payload.customerMobiles.map((m) => String(m).trim()).filter(Boolean)
+        : [];
+      setCustomerName(String(payload.customerName || '').trim());
+      setCustomerMobiles(mobiles.length ? mobiles : ['']);
+      setCustomerAddress(String(payload.customerAddress || '').trim());
+      setCustomerCategory(normalizeCustomerCategory(payload.customerCategory));
+
+      const b64 = String(payload.photoBase64 || '').trim();
+      const mime = String(payload.photoMime || 'image/jpeg').trim();
+      if (b64) {
+        setPhotoBase64(b64);
+        setPhotoLocalUri(`data:${mime};base64,${b64}`);
+        setCustomerPhoto('');
+      } else {
+        const photo = String(payload.customerPhoto || '').trim();
+        setCustomerPhoto(photo);
+        setPhotoLocalUri(photo && /^https?:\/\//i.test(photo) ? photo : '');
+        setPhotoBase64('');
+      }
+
+      setShowAdminOverride(false);
+      setAdminPassword('');
+      setAdminOverrideGranted(false);
+
+      setAdvanceAmount('');
+      setPaymentMode('');
+      setPaymentTo('');
+      setFullAdvanceReceived(false);
+
+      setRemarks('');
+
+      if (pastedRemarks) {
+        const preview =
+          pastedRemarks.length > 900 ? `${pastedRemarks.slice(0, 900).trim()}…` : pastedRemarks;
+        showAlert(
+          'Notes from the other plot',
+          `The entry you copied had these notes on the original plot:\n\n“${preview}”\n\nThose notes belong to that plot only. Should we copy the same text into the notes field for this plot, or leave notes empty?`,
+          [
+            {
+              text: 'Copy notes to this plot',
+              onPress: () => setRemarks(pastedRemarks),
+            },
+            {
+              text: 'Leave notes blank',
+              style: 'cancel',
+              onPress: () => setRemarks(''),
+            },
+          ],
+          { verticalButtons: true },
+        );
+      } else {
+        showAlert(
+          'Details pasted',
+          'Customer details have been added to this form. Review everything, then save when you are ready.',
+        );
+      }
+    } catch {
+      showAlert('Unable to paste', 'We could not read the clipboard. Please try again.');
+    }
+  };
+
+  const pasteCustomerIntoEditSheet = async () => {
+    if (readOnlyGuest || isEditingWaiter || isSavingBookingEdit) return;
+    try {
+      const raw = await Clipboard.getString();
+      const payload = parsePlotVistaCustomerClipboard(raw);
+      if (!payload) {
+        showAlert(
+          'Nothing to paste',
+          'The clipboard does not contain PlotVista customer details. Use Copy on a waiting or booked entry first.',
+        );
+        return;
+      }
+      const mobiles = Array.isArray(payload.customerMobiles)
+        ? payload.customerMobiles.map((m) => String(m).trim()).filter(Boolean)
+        : [];
+      setEditWaiterName(String(payload.customerName || '').trim());
+      setEditWaiterMobiles(mobiles.length ? mobiles : ['']);
+      setEditWaiterAddress(String(payload.customerAddress || '').trim());
+      setEditCustomerCategory(normalizeCustomerCategory(payload.customerCategory));
+
+      showAlert(
+        'Details pasted',
+        editBookingOpen
+          ? 'Customer details have been added. Advance and payment were not changed — update those on this booking only, then tap Save.'
+          : 'Customer details have been added to this form. Review everything, then tap Save.',
+      );
+    } catch {
+      showAlert('Unable to paste', 'We could not read the clipboard. Please try again.');
     }
   };
 
@@ -646,8 +1210,638 @@ const BookingModal = ({
     return null;
   };
 
+  // ────────────────────────────────────────────────────────────────────────────
+  // Mark-Open + Transfer (vacate-and-transfer) derivations
+  // ────────────────────────────────────────────────────────────────────────────
+
+  /** Source plots whose advance is being moved/refunded. Empty when no booked sources. */
+  const transferSourcePlots = React.useMemo(() => {
+    if (isBulk) {
+      return Array.isArray(selectedPlots)
+        ? selectedPlots.filter((p) => p?.status === 'booked')
+        : [];
+    }
+    return plot?.status === 'booked' ? [plot] : [];
+  }, [isBulk, selectedPlots, plot]);
+
+  /** Total advance currently on the source plot(s) — denominated in rupees (whole units). */
+  const totalReceivedFromSources = React.useMemo(() => {
+    return transferSourcePlots.reduce((sum, p) => {
+      const v = Number(p?.bookingDetails?.advanceAmount);
+      return sum + (Number.isFinite(v) ? v : 0);
+    }, 0);
+  }, [transferSourcePlots]);
+
+  /** Refund amount as a number, validated lightly (>=0). */
+  const parsedRefundAmountForTransfer = React.useMemo(() => {
+    const n = Number(String(refundAmount).replace(/,/g, ''));
+    if (!Number.isFinite(n) || n < 0) return 0;
+    return n;
+  }, [refundAmount]);
+
+  /** Money left after subtracting refund — what gets distributed to destinations. */
+  const transferableTotalRupees = React.useMemo(() => {
+    return Math.max(0, totalReceivedFromSources - parsedRefundAmountForTransfer);
+  }, [totalReceivedFromSources, parsedRefundAmountForTransfer]);
+
+  /**
+   * Even split (paise-correct) across N destinations.
+   * Mirrors the server-side splitter so client previews match what the server stores.
+   * Returns an array of rupee amounts (number, may have ≤ 2 decimals).
+   */
+  const computeEvenSliceRupees = useCallback((totalRupees, n) => {
+    if (!n || n <= 0) return [];
+    const totalPaise = Math.round(Number(totalRupees) * 100);
+    const base = Math.floor(totalPaise / n);
+    const rem = totalPaise - base * n;
+    return Array.from({ length: n }, (_, i) => {
+      const p = base + (i < rem ? 1 : 0);
+      return p / 100;
+    });
+  }, []);
+
+  const destinationSliceRupees = React.useMemo(
+    () => computeEvenSliceRupees(transferableTotalRupees, vacateTransferDestinations.length),
+    [computeEvenSliceRupees, transferableTotalRupees, vacateTransferDestinations.length],
+  );
+
+  const hasTransferDestinations = vacateTransferDestinations.length > 0;
+
+  /**
+   * UI gates derived from the OPEN-with-refund mode picker. They control which
+   * cards are rendered inside the `activeAction === 'refundOpen'` step so the
+   * user only sees fields relevant to the option they picked.
+   *
+   *   showRefundFields  → refund mode/amount/by/remarks inputs
+   *   showTransferCard  → "Transfer to other plots" card with destinations
+   *   showPaymentCard   → wrapper card around refund inputs and/or waiting reason
+   *                       (waiting cancellation reason is shown regardless of
+   *                       the mode picker because it covers a separate concern)
+   */
+  const showRefundFields =
+    needsRefundToOpen && (vacateMode === 'refund' || vacateMode === 'both');
+  const showTransferCard =
+    needsRefundToOpen &&
+    !readOnlyGuest &&
+    (vacateMode === 'transfer' || vacateMode === 'both');
+  const showPaymentCard = showRefundFields || needsWaitingReasonToOpen;
+
+  /**
+   * Switch the OPEN-mode picker. Cleans up state that no longer applies so
+   * stale inputs from a previously chosen mode can't sneak into the payload.
+   */
+  const handlePickVacateMode = useCallback(
+    (mode) => {
+      if (mode === vacateMode) return;
+      setVacateMode(mode);
+      if (mode === 'refund') {
+        // Refund-only flow takes the standard /status endpoint — destinations
+        // would otherwise re-route to /transfer-and-vacate and confuse the user.
+        setVacateTransferDestinations([]);
+      }
+      if (mode === 'transfer') {
+        // Transfer-only hides the refund inputs; clear them so an old value
+        // can't slip in if the user toggles back later.
+        setRefundMode('');
+        setRefundAmount('');
+        setRefundBy('');
+        setRefundRemarks('');
+      }
+    },
+    [vacateMode],
+  );
+
+  /** Validates the destination list before submit. Returns first error string or null. */
+  const validateTransferDestinations = useCallback(() => {
+    if (!hasTransferDestinations) return null;
+    if (transferSourcePlots.length === 0) {
+      return 'Add a destination only when at least one booked source plot is being opened.';
+    }
+    if (transferableTotalRupees <= 0) {
+      return 'Nothing left to transfer after refund. Lower the refund or remove destinations.';
+    }
+    const sourceIdSet = new Set(transferSourcePlots.map((p) => String(p._id)));
+    const seen = new Set();
+    for (const d of vacateTransferDestinations) {
+      if (!d.plotId) return 'Pick a destination plot for every destination row.';
+      if (sourceIdSet.has(String(d.plotId))) {
+        return `Plot No. ${d.plot?.plotNumber ?? '?'} is being opened — it cannot also be a destination.`;
+      }
+      if (seen.has(String(d.plotId))) {
+        return `Plot No. ${d.plot?.plotNumber ?? '?'} is selected more than once as a destination.`;
+      }
+      seen.add(String(d.plotId));
+      if (d.plot?.status === 'BM') {
+        return `Plot No. ${d.plot?.plotNumber ?? '?'} is BM and cannot receive a transfer.`;
+      }
+      if (d.plot?.status === 'vacant') {
+        const cf = d.customerForm || {};
+        if (!String(cf.customerName || '').trim()) {
+          return `Enter customer name for vacant Plot No. ${d.plot?.plotNumber ?? '?'}.`;
+        }
+        const mobiles = Array.isArray(cf.customerMobiles) ? cf.customerMobiles : [];
+        const firstMobile = String(mobiles[0] || '').trim();
+        if (!firstMobile) {
+          return `Enter a contact number for vacant Plot No. ${d.plot?.plotNumber ?? '?'}.`;
+        }
+        if (!String(cf.paymentMode || '').trim()) {
+          return `Select payment mode for vacant Plot No. ${d.plot?.plotNumber ?? '?'}.`;
+        }
+        if (!String(cf.paymentTo || '').trim()) {
+          return `Enter "payment to" for vacant Plot No. ${d.plot?.plotNumber ?? '?'}.`;
+        }
+      }
+      if (d.plot?.status === 'waiting') {
+        const hasFirstWaiter = Array.isArray(d.plot?.waitingList) && d.plot.waitingList.length > 0;
+        if (!hasFirstWaiter) {
+          return `Plot No. ${d.plot?.plotNumber ?? '?'} has no waiting customer to finalise.`;
+        }
+      }
+    }
+    return null;
+  }, [
+    hasTransferDestinations,
+    transferSourcePlots,
+    transferableTotalRupees,
+    vacateTransferDestinations,
+  ]);
+
+  /** Begin the on-map picker for one or more destinations. */
+  const addTransferDestinationRow = useCallback(() => {
+    if (!onRequestTransferTargetByMap) {
+      showAlert('Cannot pick on map', 'Map picker is unavailable in this context.');
+      return;
+    }
+    if (transferSourcePlots.length === 0) {
+      showAlert(
+        'No booked source plot',
+        'Transfer is only available when at least one booked plot is being marked OPEN.',
+      );
+      return;
+    }
+    setAwaitingVacateTransferPick(true);
+    onRequestTransferTargetByMap({ kind: 'vacate-transfer', waitingId: null });
+  }, [onRequestTransferTargetByMap, showAlert, transferSourcePlots.length]);
+
+  const removeTransferDestinationRow = useCallback((tempId) => {
+    setVacateTransferDestinations((prev) => prev.filter((d) => d.tempId !== tempId));
+  }, []);
+
+  const updateTransferDestinationCustomer = useCallback((tempId, patch) => {
+    setVacateTransferDestinations((prev) =>
+      prev.map((d) =>
+        d.tempId === tempId
+          ? { ...d, customerForm: { ...(d.customerForm || {}), ...patch } }
+          : d,
+      ),
+    );
+  }, []);
+
+  /**
+   * When the source is a single booked plot, copy its booking customer details into
+   * the destination's customer form so a vacant→new-booking transfer doesn't force
+   * the user to retype name / mobile / address / category / payment fields. The
+   * user can still freely edit any field. Returns null when the rule doesn't apply
+   * (bulk source, source not booked, etc.) so the form starts empty.
+   */
+  const buildVacantDestinationPrefill = useCallback(() => {
+    const empty = {
+      customerName: '',
+      customerMobiles: [''],
+      customerAddress: '',
+      customerCategory: 'regular',
+      paymentMode: '',
+      paymentTo: '',
+      remarks: '',
+    };
+    if (isBulk) return empty;
+    if (transferSourcePlots.length !== 1) return empty;
+    const src = transferSourcePlots[0];
+    const sbd = src?.bookingDetails;
+    if (!sbd) return empty;
+    const mobiles = Array.isArray(sbd.customerMobiles)
+      ? sbd.customerMobiles.map((m) => String(m || '').trim()).filter(Boolean)
+      : [];
+    return {
+      customerName: String(sbd.customerName || '').trim(),
+      customerMobiles: mobiles.length > 0 ? mobiles : [''],
+      customerAddress: String(sbd.customerAddress || '').trim(),
+      customerCategory: normalizeCustomerCategory(sbd.customerCategory || 'regular'),
+      paymentMode: String(sbd.paymentMode || '').trim(),
+      paymentTo: String(sbd.paymentTo || '').trim(),
+      remarks: '',
+    };
+  }, [isBulk, transferSourcePlots]);
+
+  /**
+   * Consume `pendingTransferTargetPlots` (array) for the vacate-transfer flow.
+   * Single-pick and multi-pick both use this channel: LayoutScreen passes a
+   * 1-element array for single tap and an N-element array for the long-press
+   * multi-select flow. The existing booking/waiting transfer flow uses the
+   * separate `pendingTransferTarget` (singular) channel and is untouched.
+   */
+  useEffect(() => {
+    if (!visible) return;
+    if (!awaitingVacateTransferPick) return;
+    if (!Array.isArray(pendingTransferTargetPlots) || pendingTransferTargetPlots.length === 0) return;
+
+    const sourceIdSet = new Set(transferSourcePlots.map((p) => String(p._id)));
+    const existingDestIds = new Set(
+      vacateTransferDestinations.map((d) => String(d.plotId)),
+    );
+
+    const accepted = [];
+    const skipped = []; // { plotNumber, reason }
+    for (const picked of pendingTransferTargetPlots) {
+      if (!picked || !picked._id) continue;
+      const id = String(picked._id);
+      if (sourceIdSet.has(id)) {
+        skipped.push({
+          plotNumber: picked.plotNumber,
+          reason: 'is being opened — cannot also be a destination',
+        });
+        continue;
+      }
+      if (picked.status === 'BM') {
+        skipped.push({ plotNumber: picked.plotNumber, reason: 'is BM (reserved)' });
+        continue;
+      }
+      if (existingDestIds.has(id)) {
+        skipped.push({
+          plotNumber: picked.plotNumber,
+          reason: 'is already in the destination list',
+        });
+        continue;
+      }
+      existingDestIds.add(id);
+      accepted.push(picked);
+    }
+
+    if (accepted.length > 0) {
+      setVacateTransferDestinations((prev) => [
+        ...prev,
+        ...accepted.map((picked, idx) => ({
+          tempId: `dest-${Date.now()}-${idx}-${Math.random().toString(36).slice(2, 6)}`,
+          plotId: picked._id,
+          plot: picked,
+          customerForm:
+            picked.status === 'vacant' ? buildVacantDestinationPrefill() : null,
+        })),
+      ]);
+    }
+
+    if (skipped.length > 0) {
+      const lines = skipped
+        .map((s) => `• Plot No. ${s.plotNumber} ${s.reason}`)
+        .join('\n');
+      showAlert(
+        accepted.length > 0 ? 'Some plots skipped' : 'No destinations added',
+        lines,
+      );
+    }
+
+    setAwaitingVacateTransferPick(false);
+    onConsumedPendingTransferTargetPlots?.();
+  }, [
+    visible,
+    awaitingVacateTransferPick,
+    pendingTransferTargetPlots,
+    vacateTransferDestinations,
+    transferSourcePlots,
+    showAlert,
+    onConsumedPendingTransferTargetPlots,
+    buildVacantDestinationPrefill,
+  ]);
+
+  const parseAdvanceValue = useCallback((value) => {
+    const txt = String(value ?? '').trim().replace(/,/g, '');
+    if (!txt) return null;
+    const n = Number(txt);
+    return Number.isNaN(n) ? null : n;
+  }, []);
+
+  const formatRupees = useCallback((value) => `Rs. ${Number(value).toLocaleString()}`, []);
+
+  const confirmFullAdvanceToggle = useCallback((nextChecked, opts = {}) => {
+    const { advanceInput = '', categoryForPricing = 'regular' } = opts;
+    const enteredFallback = parseAdvanceValue(advanceInput);
+
+    if (!nextChecked) {
+      showAlert(
+        'Remove full advance mark?',
+        'This clears the “full advance received” flag. It does not change the advance amount stored on the booking.',
+        [
+          { text: 'Cancel', style: 'cancel' },
+          {
+            text: 'Remove mark',
+            style: 'destructive',
+            onPress: () => {
+              setFullAdvanceReceived(false);
+            },
+          },
+        ],
+      );
+      return;
+    }
+
+    const plotsForPricing =
+      isBulk && selectedPlots.length > 0
+        ? selectedPlots
+        : plot
+          ? [plot]
+          : [];
+
+    const confirmYes = () => {
+      setFullAdvanceReceived(true);
+    };
+
+    const isScholarCustomer = normalizeCustomerCategory(categoryForPricing) === 'scholar';
+
+    let scholarIdForPricing = null;
+    if (isScholarCustomer && plotsForPricing.length > 0) {
+      if (plotsForPricing.length === 1) {
+        scholarIdForPricing = String(plotsForPricing[0]._id);
+      } else if (isBulk) {
+        scholarIdForPricing = scholarDiscountPlotId;
+      } else {
+        scholarIdForPricing = String(plotsForPricing[0]._id);
+      }
+    }
+
+    if (
+      isScholarCustomer &&
+      isBulk &&
+      plotsForPricing.length > 1 &&
+      !scholarIdForPricing
+    ) {
+      setScholarPlotPickerVisible(true);
+      return;
+    }
+
+    if (plotsForPricing.length === 0) {
+      if (enteredFallback == null) {
+        showAlert(
+          'Advance amount required',
+          'Enter the booking advance amount before marking full advance as received.',
+        );
+        return;
+      }
+      showAlert(
+        'Confirm full advance received',
+        `You entered ${formatRupees(enteredFallback)}. Confirm that this full amount has been received?`,
+        [
+          { text: 'Cancel', style: 'cancel' },
+          { text: 'Yes', onPress: confirmYes },
+        ],
+        { detailedMessage: true },
+      );
+      return;
+    }
+
+    const rowArgs = { isScholarCustomer, scholarDiscountPlotId: scholarIdForPricing };
+    const rows = plotsForPricing.map((p) => {
+      const row = getExpectedBookingAdvanceRow(p, rowArgs);
+      return row;
+    });
+
+    const pricedRows = rows.filter((r) => r.expected != null);
+    const pricedTotal = pricedRows.reduce((s, r) => s + r.expected, 0);
+    const allHavePricing = rows.length > 0 && pricedRows.length === rows.length;
+    const noneHavePricing = pricedRows.length === 0;
+
+    if (rows.length === 1) {
+      const r = rows[0];
+      let msg;
+      if (r.expected != null) {
+        msg = `Expected advance for Plot No. ${r.plotNumber} (${r.rateLabel} pricing) is ${formatRupees(
+          r.expected,
+        )}.\n\nConfirm that this full amount has been received?`;
+      } else if (enteredFallback != null) {
+        msg = `This plot has no advance in pricing data for the ${r.rateLabel} rate. You entered ${formatRupees(
+          enteredFallback,
+        )} as the booking advance.\n\nConfirm that the full advance has been received?`;
+      } else {
+        showAlert(
+          'Cannot confirm',
+          'This plot has no advance in pricing for the selected customer type. Enter the booking advance amount first.',
+        );
+        return;
+      }
+      showAlert('Confirm full advance received', msg, [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Yes', onPress: confirmYes },
+      ], { detailedMessage: true });
+      return;
+    }
+
+    if (noneHavePricing) {
+      if (enteredFallback == null) {
+        showAlert(
+          'Pricing data missing',
+          'None of the selected plots have an advance in pricing for the rates used (regular / Alim-Hafiz). Enter booking advances or update plot pricing, then try again.',
+        );
+        return;
+      }
+      if (isBulk && rows.length > 1) {
+        showAlert(
+          'Confirm full advance received',
+          `No per-plot advance is listed in pricing for these rates. You entered ${formatRupees(
+            enteredFallback,
+          )} as the combined booking advance for ${rows.length} plots.\n\nWhen you book, choose whether to split that total equally across plots so each record shows its share.\n\nConfirm that this combined amount has been fully received?`,
+          [
+            { text: 'Cancel', style: 'cancel' },
+            { text: 'Yes', onPress: confirmYes },
+          ],
+          { detailedMessage: true },
+        );
+        return;
+      }
+      const equation = rows
+        .map((x) => `Plot No. ${x.plotNumber}: ${formatRupees(enteredFallback)}`)
+        .join('\n');
+      const total = enteredFallback * rows.length;
+      showAlert(
+        'Confirm full advance received',
+        `Pricing does not list an expected advance for these plots. Using your entered amount for each plot:\n\n${equation}\n\nTotal: ${formatRupees(
+          total,
+        )}\n\nConfirm that the full combined amount has been received?`,
+        [
+          { text: 'Cancel', style: 'cancel' },
+          { text: 'Yes', onPress: confirmYes },
+        ],
+        { detailedMessage: true },
+      );
+      return;
+    }
+
+    const scholarPlotMeta =
+      isScholarCustomer && scholarIdForPricing && rows.length > 1
+        ? plotsForPricing.find((p) => String(p._id) === String(scholarIdForPricing))
+        : null;
+
+    const lineText = rows
+      .map((r) =>
+        r.expected != null
+          ? `Plot No. ${r.plotNumber}: ${formatRupees(r.expected)} (${r.rateLabel})`
+          : `Plot No. ${r.plotNumber}: (no advance in pricing — ${r.rateLabel})`,
+      )
+      .join('\n');
+
+    const typeLine = isScholarCustomer
+      ? `Customer type: Alim / Hafiz — scholar advance applies to one plot only${
+          scholarPlotMeta
+            ? ` (currently Plot No. ${String(scholarPlotMeta.plotNumber ?? '').trim() || '—'}).`
+            : '.'
+        }`
+      : 'Customer type: Regular — all plots use regular pricing.';
+
+    let msg = `${typeLine}\n\nExpected advance per plot (same rule as Multi Plot Summary):\n\n${lineText}\n\n`;
+    msg += `Combined expected advance: ${formatRupees(pricedTotal)}`;
+    if (!allHavePricing) {
+      msg += '\n\nThis total only includes plots where pricing lists an advance.';
+    }
+    msg += '\n\nConfirm that the full combined amount has been received for these plots?';
+
+    showAlert('Confirm full advance received', msg, [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Yes', onPress: confirmYes },
+    ], { detailedMessage: true });
+  }, [formatRupees, isBulk, parseAdvanceValue, plot, selectedPlots, showAlert, scholarDiscountPlotId]);
+
+  /**
+   * Mark-Open + Transfer flow.
+   * Calls the dedicated /transfer-and-vacate endpoint which atomically opens all
+   * source plots and lands the (post-refund) balance on the destination(s).
+   * Returns true if the flow ran (success OR caught error); false if not applicable.
+   */
+  const submitTransferAndVacate = async () => {
+    if (!hasTransferDestinations) return false;
+
+    // Transfer-only mode: refund inputs are intentionally hidden, so don't
+    // validate or include them in the payload — the entire received amount
+    // is being moved to the destination(s).
+    const isTransferOnly = vacateMode === 'transfer';
+    const refundErr =
+      !isTransferOnly && parsedRefundAmountForTransfer > 0
+        ? validateRefundClient()
+        : null;
+    if (refundErr) {
+      showAlert('Required', refundErr);
+      return true;
+    }
+    const destErr = validateTransferDestinations();
+    if (destErr) {
+      showAlert('Required', destErr);
+      return true;
+    }
+    if (needsWaitingReasonToOpen && !openWaitingRemarks.trim()) {
+      // Source plot(s) with waiting entries still need a clearance reason —
+      // we forward it as the source's removalRemarks-equivalent narrative line.
+      showAlert('Required', 'Please enter cancellation reason for waiting entries.');
+      return true;
+    }
+
+    try {
+      setIsSubmittingTransferAndVacate(true);
+      setIsSubmitting(true);
+
+      const refundPayload =
+        !isTransferOnly && parsedRefundAmountForTransfer > 0
+          ? {
+              amount: parsedRefundAmountForTransfer,
+              mode: refundMode.trim(),
+              by: refundBy.trim(),
+              remarks: refundRemarks.trim(),
+            }
+          : null;
+
+      const destinationsPayload = vacateTransferDestinations.map((d, idx) => {
+        const slice = destinationSliceRupees[idx];
+        const base = { plotId: d.plotId, slice };
+        if (d.plot?.status === 'vacant' && d.customerForm) {
+          const cf = d.customerForm;
+          base.customerDetails = {
+            customerName: String(cf.customerName || '').trim(),
+            customerMobiles: (cf.customerMobiles || [])
+              .map((m) => String(m || '').trim())
+              .filter(Boolean),
+            customerAddress: String(cf.customerAddress || '').trim(),
+            customerCategory: normalizeCustomerCategory(cf.customerCategory || 'regular'),
+            customerPhoto: '',
+            paymentMode: String(cf.paymentMode || '').trim(),
+            paymentTo: String(cf.paymentTo || '').trim(),
+          };
+        }
+        if (d.plot?.status === 'waiting') {
+          // Default to first waiter (matches existing make-final UX).
+          const firstWaiter = Array.isArray(d.plot.waitingList) ? d.plot.waitingList[0] : null;
+          if (firstWaiter?._id) base.waiterId = String(firstWaiter._id);
+        }
+        return base;
+      });
+
+      const body = {
+        sourceIds: transferSourcePlots.map((p) => String(p._id)),
+        refund: refundPayload,
+        destinations: destinationsPayload,
+      };
+
+      const res = await api.post('/transfer-and-vacate', body);
+      const data = res?.data || {};
+
+      // Best-effort CometChat / activity feed narrative — server already wrote
+      // a comprehensive narrative into every plot's history, but the realtime
+      // activity stream still wants a one-liner per session.
+      if (typeof onActivitySummary === 'function' && data?.narrative) {
+        onActivitySummary(String(data.narrative));
+      }
+
+      // Socket events from the backend will refresh map state for all touched
+      // plots, but we still close the modal so the user sees the result.
+      onClose?.();
+    } catch (e) {
+      console.error('[BookingModal] transfer-and-vacate error:', e?.message);
+      const apiMsg = e?.response?.data?.message;
+      showAlert('Could not transfer', apiMsg || 'Something went wrong. Please try again.');
+    } finally {
+      setIsSubmittingTransferAndVacate(false);
+      setIsSubmitting(false);
+    }
+    return true;
+  };
+
   const handleSubmit = async (status) => {
     if (status === 'vacant') {
+      // Mark-Open mode picker: when the source is a booked plot, the user must
+      // explicitly choose Refund / Transfer / Both before we let them submit.
+      if (needsRefundToOpen && !vacateMode) {
+        showAlert(
+          'Choose an option',
+          'Pick how to handle the advance: Refund only, Transfer only, or Refund + Transfer.',
+        );
+        return;
+      }
+      // Transfer-only / Both both require at least one destination — guard
+      // against an accidental tap before any destination has been added.
+      if (
+        needsRefundToOpen &&
+        (vacateMode === 'transfer' || vacateMode === 'both') &&
+        !hasTransferDestinations
+      ) {
+        showAlert(
+          'Add destination',
+          'Pick at least one destination plot to receive the transferred amount.',
+        );
+        return;
+      }
+
+      // Transfer-and-vacate intercept: when destinations are queued, route to
+      // the dedicated endpoint instead of the standard mark-open path.
+      if (hasTransferDestinations) {
+        await submitTransferAndVacate();
+        return;
+      }
+
       if (needsRefundToOpen) {
         const err = validateRefundClient();
         if (err) {
@@ -719,6 +1913,14 @@ const BookingModal = ({
       }
     }
 
+    if (status === 'booked' && isBulk && selectedPlots.some((p) => p.status === 'waiting')) {
+      showAlert(
+        'Final booking unavailable',
+        'One or more selected plots have waiting entries. Bulk booking is only allowed when no selected plot is in waiting status.',
+      );
+      return;
+    }
+
     if (status === 'booked') {
       if (!advanceAmount && !adminOverrideGranted) {
         showAlert(
@@ -737,38 +1939,128 @@ const BookingModal = ({
       }
     }
 
-    try {
-      setIsSubmitting(true);
-      let finalPhotoUrl = await uploadPhoto();
-      const existingPhoto = String(customerPhoto || '').trim();
-      if (!finalPhotoUrl && existingPhoto && /^https?:\/\//i.test(existingPhoto)) {
-        finalPhotoUrl = existingPhoto;
+    const runUpdate = async (submitStatus, bulkBookAdvanceMode) => {
+      try {
+        setIsSubmitting(true);
+        let finalPhotoUrl = await uploadPhoto();
+        const existingPhoto = String(customerPhoto || '').trim();
+        if (!finalPhotoUrl && existingPhoto && /^https?:\/\//i.test(existingPhoto)) {
+          finalPhotoUrl = existingPhoto;
+        }
+        const mobiles = customerMobiles.filter((m) => m.trim());
+        const userRemarks = remarks.trim();
+        const bulkPlotNumbersLine =
+          isBulk && selectedPlots.length > 0 && (submitStatus === 'booked' || submitStatus === 'waiting')
+            ? (() => {
+                const nums = selectedPlots
+                  .map((p) => String(p?.plotNumber ?? '').trim())
+                  .filter(Boolean);
+                if (!nums.length) return '';
+                return `Multiple plots: ${nums.map((n) => `Plot No. ${n}`).join(', ')}`;
+              })()
+            : '';
+
+        const equalSplits =
+          submitStatus === 'booked' &&
+          bulkBookAdvanceMode === 'equal' &&
+          isBulk &&
+          selectedPlots.length > 1
+            ? splitAdvanceTotalEvenly(advanceAmount, selectedPlots)
+            : null;
+        const splitRemark =
+          equalSplits && equalSplits.length
+            ? buildBulkEqualSplitRemarkLines(advanceAmount, equalSplits, formatRupees)
+            : '';
+        const mergedRemarks = [userRemarks, bulkPlotNumbersLine, splitRemark].filter(Boolean).join('\n\n');
+
+        let advanceByPlotId;
+        let bookingAdvanceNum =
+          submitStatus === 'booked' && String(advanceAmount ?? '').trim()
+            ? parseFloat(String(advanceAmount).replace(/,/g, ''))
+            : null;
+        if (bookingAdvanceNum != null && Number.isNaN(bookingAdvanceNum)) {
+          bookingAdvanceNum = null;
+        }
+        if (submitStatus === 'booked' && equalSplits && equalSplits.length) {
+          advanceByPlotId = {};
+          equalSplits.forEach((s) => {
+            advanceByPlotId[s.plotId] = s.advanceAmount;
+          });
+          bookingAdvanceNum = null;
+        }
+
+        const payload = {
+          status: submitStatus,
+          customerName: customerName.trim(),
+          customerMobiles: mobiles,
+          customerAddress: customerAddress.trim(),
+          customerCategory: normalizeCustomerCategory(customerCategory),
+          customerPhoto: finalPhotoUrl,
+          ...(submitStatus === 'booked' && {
+            ...(advanceByPlotId              ? { advanceByPlotId }
+              : { advanceAmount: Number.isNaN(bookingAdvanceNum) ? null : bookingAdvanceNum }),
+            paymentMode,
+            paymentTo: paymentTo.trim(),
+            remarks: mergedRemarks,
+            isFullAdvanceReceived: !!fullAdvanceReceived,
+          }),
+          ...(submitStatus === 'waiting' && mergedRemarks ? { remarks: mergedRemarks } : {}),
+        };
+        await onUpdate(payload);
+      } catch (e) {
+        console.error('[BookingModal] handleSubmit error:', e.message);
+        showAlert('Error', 'Something went wrong. Please try again.');
+      } finally {
+        setIsSubmitting(false);
       }
-      const mobiles = customerMobiles.filter((m) => m.trim());
-      const payload = {
-        status,
-        customerName: customerName.trim(),
-        customerMobiles: mobiles,
-        customerAddress: customerAddress.trim(),
-        customerCategory: normalizeCustomerCategory(customerCategory),
-        customerPhoto: finalPhotoUrl,
-        ...(status === 'booked' && {
-          advanceAmount: advanceAmount ? parseFloat(advanceAmount) : null,
-          paymentMode,
-          paymentTo: paymentTo.trim(),
-          remarks: remarks.trim(),
-        }),
-        ...(status === 'waiting' && remarks.trim()
-          ? { remarks: remarks.trim() }
-          : {}),
-      };
-      await onUpdate(payload);
-    } catch (e) {
-      console.error('[BookingModal] handleSubmit error:', e.message);
-      showAlert('Error', 'Something went wrong. Please try again.');
-    } finally {
-      setIsSubmitting(false);
+    };
+
+    if (status === 'booked') {
+      const advanceNum = parseAdvanceValue(advanceAmount);
+      const needsBulkAdvanceChoice =
+        isBulk &&
+        selectedPlots.length > 1 &&
+        !adminOverrideGranted &&
+        advanceNum != null &&
+        advanceNum > 0;
+
+      if (needsBulkAdvanceChoice) {
+        const splits = splitAdvanceTotalEvenly(advanceAmount, selectedPlots);
+        const preview =
+          splits?.map((s) => `Plot No. ${s.plotNumber}: ${formatRupees(s.advanceAmount)}`).join('\n') || '';
+        showAlert(
+          'Advance across plots',
+          `You entered ${formatRupees(advanceNum)} as the total booking advance.\n\n` +
+            `Should this amount be divided equally among the ${selectedPlots.length} selected plots?\n\n` +
+            `If yes, each plot will record its share:\n${preview}\n\n` +
+            `The total will be noted in remarks on every plot. ` +
+            `If no, the full ${formatRupees(advanceNum)} will be stored on each plot (only if each plot truly received that much).`,
+          [
+            { text: 'Cancel', style: 'cancel' },
+            {
+              text: 'Full amount each plot',
+              style: 'destructive',
+              onPress: () => {
+                showAlert(
+                  'Confirm',
+                  `Each plot will show advance ${formatRupees(advanceNum)}. Summed across plots that is ${formatRupees(
+                    advanceNum * selectedPlots.length,
+                  )}.`,
+                  [
+                    { text: 'Back', style: 'cancel' },
+                    { text: 'Continue', onPress: () => void runUpdate(status, 'repeat') },
+                  ],
+                );
+              },
+            },
+            { text: 'Divide equally', onPress: () => void runUpdate(status, 'equal') },
+          ],
+        );
+        return;
+      }
     }
+
+    await runUpdate(status, null);
   };
 
   const openRemoveWaiter = (waitingId) => {
@@ -875,7 +2167,7 @@ const BookingModal = ({
       });
       setRemoveWaiterId(null);
       setRemoveWaiterReason('');
-      const updatedPlot = res?.data;
+      const updatedPlot = res?.data?.plot || res?.data;
       if (
         updatedPlot &&
         Array.isArray(updatedPlot.waitingList) &&
@@ -974,6 +2266,7 @@ const BookingModal = ({
         advanceAmount: advanceNum,
         paymentMode: editBookingPaymentMode.trim(),
         paymentTo: editBookingPaymentTo.trim(),
+        isFullAdvanceReceived: Boolean(plot.bookingDetails?.isFullAdvanceReceived),
       });
       onActivitySummary?.({
         type: 'update_booking',
@@ -1052,6 +2345,10 @@ const BookingModal = ({
   const showWaitlistAndBook = isBulk
     ? hasBulkSelection && !selectedPlots.some((p) => p.status === 'booked' || p.status === 'BM')
     : Boolean(plot) && plot.status !== 'booked' && plot.status !== 'BM';
+  /** Bulk: hide Final booking if any selected plot already has waiting (cannot bulk “instant book” that set). */
+  const showFinalBookingQuickAction =
+    showWaitlistAndBook &&
+    (!isBulk || !selectedPlots.some((p) => p.status === 'waiting'));
   const showBmButton = isBulk
     ? hasBulkSelection && !selectedPlots.some((p) => p.status === 'booked' || p.status === 'BM')
     : Boolean(plot) && plot.status !== 'booked' && plot.status !== 'BM';
@@ -1075,13 +2372,15 @@ const BookingModal = ({
               <View style={{ flex: 1 }}>
                 <Text style={styles.plotTitle}>{plotTitle}</Text>
                 {!isBulk && headerPlot && (
-                  <StatusBadge
-                    status={headerPlot.status}
-                    waiterCount={headerPlot.waitingList ? headerPlot.waitingList.length : 0}
-                    styles={styles}
-                    colors={colors}
-                    isDark={isDark}
-                  />
+                  <View style={styles.statusRow}>
+                    <StatusBadge
+                      status={headerPlot.status}
+                      waiterCount={headerPlot.waitingList ? headerPlot.waitingList.length : 0}
+                      styles={styles}
+                      colors={colors}
+                      isDark={isDark}
+                    />
+                  </View>
                 )}
                 {isTransferConfirm && plot ? (
                   <Text style={styles.headerTransferFrom} numberOfLines={1}>
@@ -1217,6 +2516,7 @@ const BookingModal = ({
             ) : (
               <>
               <ScrollView
+                ref={bodyScrollRef}
                 style={[styles.bodyScroll, { maxHeight: scrollMaxHeight }]}
                 contentContainerStyle={styles.bodyContent}
                 showsVerticalScrollIndicator
@@ -1356,6 +2656,52 @@ const BookingModal = ({
                         <CustomerCategoryField value={customerCategory} onChange={setCustomerCategory} />
                       </View>
 
+                      {activeAction === 'booked' &&
+                      isBulk &&
+                      selectedPlots.length > 1 &&
+                      normalizeCustomerCategory(customerCategory) === 'scholar' ? (
+                        <View
+                          style={[
+                            styles.scholarBulkBanner,
+                            {
+                              borderColor: isDark ? '#059669' : '#a7f3d0',
+                              backgroundColor: isDark ? 'rgba(5, 150, 105, 0.14)' : '#ecfdf5',
+                            },
+                          ]}
+                        >
+                          <Icon name="school" size={22} color="#059669" />
+                          <View style={styles.scholarBulkBannerTextCol}>
+                            <Text
+                              style={[styles.scholarBulkBannerTitle, { color: isDark ? '#a7f3d0' : '#065f46' }]}
+                            >
+                              Scholar rate on one plot only
+                            </Text>
+                            <Text style={[styles.scholarBulkBannerSub, { color: colors.textSecondary }]}>
+                              Plot No.{' '}
+                              <Text style={{ fontWeight: '800', color: colors.text }}>
+                                {selectedPlots.find((p) => String(p._id) === String(scholarDiscountPlotId))
+                                  ?.plotNumber ?? '—'}
+                              </Text>{' '}
+                              uses Alim / Hafiz advance in the confirmation; other plots use regular pricing.
+                            </Text>
+                          </View>
+                          <TouchableOpacity
+                            onPress={() => setScholarPlotPickerVisible(true)}
+                            style={[
+                              styles.scholarBulkChangeBtn,
+                              { borderColor: isDark ? '#059669' : '#34d399' },
+                            ]}
+                            accessibilityLabel="Choose which plot gets Alim Hafiz pricing"
+                          >
+                            <Text
+                              style={[styles.scholarBulkChangeBtnText, { color: isDark ? '#a7f3d0' : '#047857' }]}
+                            >
+                              Change
+                            </Text>
+                          </TouchableOpacity>
+                        </View>
+                      ) : null}
+
                       <View style={styles.fieldGroup}>
                         <Text style={styles.fieldLabel}>
                           Customer Photo <Text style={styles.optional}>(Optional)</Text>
@@ -1388,6 +2734,12 @@ const BookingModal = ({
                             <Text style={styles.fieldLabel}>
                               Advance / Booking Amount <Text style={styles.required}>*</Text>
                             </Text>
+                            {isBulk && selectedPlots.length > 1 ? (
+                              <Text style={[styles.fieldHint, { color: colors.textSecondary }]}>
+                                Enter the total received for all {selectedPlots.length} plots. On submit, choose
+                                whether to split it equally per plot or store the full amount on each.
+                              </Text>
+                            ) : null}
                             <View style={styles.inputWrapper}>
                               <Text style={styles.currencySymbol}>Rs.</Text>
                               <TextInput
@@ -1584,6 +2936,14 @@ const BookingModal = ({
                               >
                                 <Icon name="pencil-outline" size={22} color={colors.primary} />
                               </TouchableOpacity>
+                              <TouchableOpacity
+                                onPress={() => { void copyBookingCustomerToClipboard(bd); }}
+                                style={styles.queueIconBtn}
+                                accessibilityRole="button"
+                                accessibilityLabel="Copy customer details to clipboard"
+                              >
+                                <Icon name="content-copy" size={22} color={colors.textSecondary} />
+                              </TouchableOpacity>
                             </View>
                           ) : null}
                         </View>
@@ -1649,7 +3009,21 @@ const BookingModal = ({
 
                         {hasPayment ? (
                           <View style={styles.queuePaymentHint}>
-                            <Text style={styles.queueFieldLabel}>Payment</Text>
+                            <View style={styles.queuePaymentHeaderRow}>
+                              <Text style={[styles.queueFieldLabel, { marginBottom: 0 }]}>Payment</Text>
+                              {!readOnlyGuest && !bd.isFullAdvanceReceived ? (
+                                <TouchableOpacity
+                                  onPress={openRecordPaymentFromSummary}
+                                  style={styles.queuePaymentMarkBtn}
+                                  accessibilityRole="button"
+                                  accessibilityLabel="Record final payment and mark complete advance received"
+                                >
+                                  <Icon name="cash-check" size={22} color="#059669" />
+                                </TouchableOpacity>
+                              ) : bd.isFullAdvanceReceived ? (
+                                <Icon name="check-decagram" size={22} color="#059669" />
+                              ) : null}
+                            </View>
                             {bd.advanceAmount != null ? (
                               <Text style={styles.queuePaymentText}>
                                 Advance: Rs. {Number(bd.advanceAmount).toLocaleString()}
@@ -1755,6 +3129,13 @@ const BookingModal = ({
                                     accessibilityLabel="Edit waiting details"
                                   >
                                     <Icon name="pencil-outline" size={22} color={colors.primary} />
+                                  </TouchableOpacity>
+                                  <TouchableOpacity
+                                    onPress={() => { void copyWaiterCustomerToClipboard(waiter); }}
+                                    style={styles.queueIconBtn}
+                                    accessibilityLabel="Copy customer details to clipboard"
+                                  >
+                                    <Icon name="content-copy" size={22} color={colors.textSecondary} />
                                   </TouchableOpacity>
                                   <TouchableOpacity
                                     onPress={() => openRemoveWaiter(waiter._id)}
@@ -1875,10 +3256,15 @@ const BookingModal = ({
                                     style={styles.makeFinalBtnCompact}
                                     onPress={() => applyWaiterToBookingForm(waiter)}
                                     activeOpacity={0.88}
-                                    accessibilityLabel="Final — use first waiting customer details"
+                                    accessibilityLabel="Mark as Final — use first waiting customer details"
                                   >
                                     <Icon name="check-circle-outline" size={17} color="#1b5e20" />
-                                    <Text style={styles.makeFinalBtnCompactText}>Final</Text>
+                                    <Text
+                                      style={styles.makeFinalBtnCompactText}
+                                      numberOfLines={2}
+                                    >
+                                      Mark as{'\n'}Final
+                                    </Text>
                                   </TouchableOpacity>
                                 ) : null}
                               </View>
@@ -1893,13 +3279,18 @@ const BookingModal = ({
 
               {/* Refund / waiting-clear reason required when opening certain plot states */}
               {activeAction === 'refundOpen' && (
-                <>
+                <View
+                  onLayout={(e) => {
+                    const y = e?.nativeEvent?.layout?.y;
+                    if (typeof y === 'number') setRefundSectionY(y);
+                  }}
+                >
                   <Text style={styles.sectionLabel}>
                     {needsRefundToOpen ? 'Refund details' : 'Cancellation details'}
                   </Text>
                   {needsRefundToOpen && (
                     <Text style={styles.refundIntro}>
-                      This plot is booked. Enter how the advance was refunded before marking it OPEN.
+                      This plot is booked. Choose how to handle the advance, then fill in the details below.
                     </Text>
                   )}
                   {!needsRefundToOpen && needsWaitingReasonToOpen && (
@@ -1920,15 +3311,92 @@ const BookingModal = ({
                     </Text>
                   )}
 
+                  {/* ───────────── Mode picker ─────────────
+                      Forces an explicit choice so the form stays short and the
+                      user knows the cards below match what they picked. */}
+                  {needsRefundToOpen && !readOnlyGuest && (
+                    <View style={styles.vacateModeBox}>
+                      <Text style={styles.vacateModeLabel}>
+                        What do you want to do? <Text style={styles.required}>*</Text>
+                      </Text>
+                      <View style={styles.vacateModeRow}>
+                        {[
+                          {
+                            key: 'refund',
+                            label: 'Complete Refund',
+                            variant: 'refund',
+                          },
+                          {
+                            key: 'transfer',
+                            label: 'Amount Transfer to other Plot',
+                            variant: 'transfer',
+                          },
+                          {
+                            key: 'both',
+                            label: 'Partial Refund + Amount Transfer',
+                            variant: 'both',
+                          },
+                        ].map((opt) => {
+                          const active = vacateMode === opt.key;
+                          const btnBase =
+                            opt.variant === 'refund'
+                              ? styles.vacateModeBtnRefund
+                              : opt.variant === 'transfer'
+                                ? styles.vacateModeBtnTransfer
+                                : styles.vacateModeBtnBoth;
+                          const btnActive =
+                            opt.variant === 'refund'
+                              ? styles.vacateModeBtnRefundActive
+                              : opt.variant === 'transfer'
+                                ? styles.vacateModeBtnTransferActive
+                                : styles.vacateModeBtnBothActive;
+                          const txtBase =
+                            opt.variant === 'refund'
+                              ? styles.vacateModeBtnTextRefund
+                              : opt.variant === 'transfer'
+                                ? styles.vacateModeBtnTextTransfer
+                                : styles.vacateModeBtnTextBoth;
+                          const txtActive =
+                            opt.variant === 'refund'
+                              ? styles.vacateModeBtnTextRefundActive
+                              : opt.variant === 'transfer'
+                                ? styles.vacateModeBtnTextTransferActive
+                                : styles.vacateModeBtnTextBothActive;
+                          return (
+                            <TouchableOpacity
+                              key={opt.key}
+                              style={[styles.vacateModeBtn, btnBase, active && btnActive]}
+                              onPress={() => handlePickVacateMode(opt.key)}
+                              accessibilityRole="button"
+                              accessibilityState={{ selected: active }}
+                            >
+                              <Text
+                                style={[styles.vacateModeBtnLabel, txtBase, active && txtActive]}
+                              >
+                                {opt.label}
+                              </Text>
+                            </TouchableOpacity>
+                          );
+                        })}
+                      </View>
+                      {!vacateMode && (
+                        <Text style={styles.vacateModeHint}>
+                          Pick one to reveal the inputs below.
+                        </Text>
+                      )}
+                    </View>
+                  )}
+
+                  {showPaymentCard && (
                   <View style={styles.paymentCard}>
-                    {needsRefundToOpen && (
+                    {showRefundFields && (
                       <View style={styles.paymentHeaderRow}>
                         <Icon name="cash-multiple" size={18} color={colors.text} />
                         <Text style={styles.paymentHeader}> Refund</Text>
                       </View>
                     )}
 
-                    {needsRefundToOpen && (
+                    {showRefundFields && (
                       <View style={styles.fieldGroup}>
                         <Text style={styles.fieldLabel}>
                           Refund mode <Text style={styles.required}>*</Text>
@@ -1951,7 +3419,7 @@ const BookingModal = ({
                       </View>
                     )}
 
-                    {needsRefundToOpen && (
+                    {showRefundFields && (
                       <View style={styles.fieldGroup}>
                         <Text style={styles.fieldLabel}>
                           Refund amount (Rs.) <Text style={styles.required}>*</Text>
@@ -1970,7 +3438,7 @@ const BookingModal = ({
                       </View>
                     )}
 
-                    {needsRefundToOpen && (
+                    {showRefundFields && (
                       <View style={styles.fieldGroup}>
                         <Text style={styles.fieldLabel}>
                           Processed by (owner) <Text style={styles.required}>*</Text>
@@ -1988,7 +3456,7 @@ const BookingModal = ({
                       </View>
                     )}
 
-                    {needsRefundToOpen && (
+                    {showRefundFields && (
                       <View style={styles.fieldGroup}>
                         <Text style={styles.fieldLabel}>
                           Refund remarks <Text style={styles.required}>*</Text>
@@ -2024,33 +3492,381 @@ const BookingModal = ({
                       </View>
                     )}
                   </View>
+                  )}
+
+                  {/* ───────────── Transfer remaining advance to other plots ───────────── */}
+                  {showTransferCard && (
+                    <View style={styles.transferCard}>
+                      <View style={styles.transferHeaderRow}>
+                        <Icon name="swap-horizontal" size={18} color={colors.text} />
+                        <Text style={styles.transferHeader}> Transfer to other plots</Text>
+                        {hasTransferDestinations ? (
+                          <View style={styles.transferActiveBadge}>
+                            <Text style={styles.transferActiveBadgeText}>
+                              {vacateTransferDestinations.length} dest.
+                            </Text>
+                          </View>
+                        ) : null}
+                      </View>
+
+                      <Text style={styles.transferIntro}>
+                        {vacateMode === 'transfer'
+                          ? `No refund — the full received amount Rs. ${totalReceivedFromSources.toLocaleString()} will be transferred to the destination(s) below.`
+                          : `Move part (or all) of the advance from ${
+                              transferSourcePlots.length > 1
+                                ? `the ${transferSourcePlots.length} booked plots being opened`
+                                : 'this plot'
+                            } onto another plot.`}
+                      </Text>
+
+                      <View style={styles.transferTotalsBox}>
+                        <View style={styles.transferTotalsRow}>
+                          <Text style={styles.transferTotalsLabel}>Total received</Text>
+                          <Text style={styles.transferTotalsValue}>
+                            Rs. {totalReceivedFromSources.toLocaleString()}
+                          </Text>
+                        </View>
+                        {vacateMode === 'both' && (
+                          <View style={styles.transferTotalsRow}>
+                            <Text style={styles.transferTotalsLabel}>Refund (above)</Text>
+                            <Text style={styles.transferTotalsValue}>
+                              Rs. {parsedRefundAmountForTransfer.toLocaleString()}
+                            </Text>
+                          </View>
+                        )}
+                        <View style={[styles.transferTotalsRow, styles.transferTotalsRowEm]}>
+                          <Text style={styles.transferTotalsLabelEm}>To transfer</Text>
+                          <Text
+                            style={[
+                              styles.transferTotalsValueEm,
+                              transferableTotalRupees <= 0 && { color: '#b91c1c' },
+                            ]}
+                          >
+                            Rs. {transferableTotalRupees.toLocaleString()}
+                          </Text>
+                        </View>
+                        {hasTransferDestinations && transferableTotalRupees > 0 ? (
+                          <Text style={styles.transferSplitHint}>
+                            {vacateTransferDestinations.length === 1
+                              ? `Goes entirely to the destination below.`
+                              : `Split equally across ${vacateTransferDestinations.length} destinations (~ Rs. ${
+                                  destinationSliceRupees[0]?.toLocaleString() ?? '0'
+                                } each).`}
+                          </Text>
+                        ) : null}
+                      </View>
+
+                      {vacateTransferDestinations.map((d, idx) => {
+                        const dPlot = d.plot || {};
+                        const slice = destinationSliceRupees[idx] ?? 0;
+                        const expected = expectedAdvanceForPlot(dPlot, dPlot.bookingDetails || {});
+                        const expectedAmt = expected?.amount;
+                        let predictedAdvance = slice;
+                        let actionLine = '';
+                        if (dPlot.status === 'vacant') {
+                          actionLine = `Will create a new booking with advance Rs. ${slice.toLocaleString()}.`;
+                          predictedAdvance = slice;
+                        } else if (dPlot.status === 'booked') {
+                          const cur = Number(dPlot?.bookingDetails?.advanceAmount || 0);
+                          predictedAdvance = cur + slice;
+                          actionLine = `Adds Rs. ${slice.toLocaleString()} to existing advance Rs. ${cur.toLocaleString()} (new total Rs. ${predictedAdvance.toLocaleString()}).`;
+                        } else if (dPlot.status === 'waiting') {
+                          const w = Array.isArray(dPlot.waitingList) ? dPlot.waitingList[0] : null;
+                          predictedAdvance = slice;
+                          actionLine = w
+                            ? `Will finalise 1st waiting (${w.customerName || '—'}) with advance Rs. ${slice.toLocaleString()}.`
+                            : `Will finalise the first waiting customer with Rs. ${slice.toLocaleString()}.`;
+                        }
+                        const willBlueTick =
+                          expectedAmt != null && Number(predictedAdvance) >= expectedAmt;
+                        const cf = d.customerForm || {};
+                        return (
+                          <View key={d.tempId} style={styles.transferDestCard}>
+                            <View style={styles.transferDestHeader}>
+                              <View style={{ flex: 1 }}>
+                                <View style={styles.transferDestTitleRow}>
+                                  <Text style={styles.transferDestTitle}>
+                                    Plot No. {dPlot.plotNumber ?? '?'}
+                                  </Text>
+                                  <View
+                                    style={[
+                                      styles.transferDestStatusPill,
+                                      {
+                                        backgroundColor:
+                                          STATUS_COLORS[dPlot.status] || colors.border,
+                                      },
+                                    ]}
+                                  >
+                                    <Text
+                                      style={[
+                                        styles.transferDestStatusPillText,
+                                        {
+                                          color:
+                                            STATUS_TEXT_COLORS[dPlot.status] || colors.text,
+                                        },
+                                      ]}
+                                    >
+                                      {String(dPlot.status || '').toUpperCase()}
+                                    </Text>
+                                  </View>
+                                  {willBlueTick ? (
+                                    <View style={styles.transferBluePredict}>
+                                      <Icon name="check-decagram" size={14} color="#1565c0" />
+                                      <Text style={styles.transferBluePredictText}>
+                                        Will mark Full Advance
+                                      </Text>
+                                    </View>
+                                  ) : null}
+                                </View>
+                                <Text style={styles.transferDestSlice}>
+                                  Receives Rs. {slice.toLocaleString()}
+                                </Text>
+                                <Text style={styles.transferDestActionLine}>{actionLine}</Text>
+                              </View>
+                              <TouchableOpacity
+                                onPress={() => removeTransferDestinationRow(d.tempId)}
+                                style={styles.transferDestRemoveBtn}
+                                accessibilityLabel={`Remove destination Plot No. ${dPlot.plotNumber}`}
+                              >
+                                <Icon name="close" size={18} color="#b91c1c" />
+                              </TouchableOpacity>
+                            </View>
+
+                            {/* Inline customer form for vacant destinations */}
+                            {dPlot.status === 'vacant' && (
+                              <View style={styles.transferCustForm}>
+                                <Text style={styles.transferCustFormHint}>
+                                  Enter buyer details for this new booking.
+                                </Text>
+
+                                <View style={styles.fieldGroup}>
+                                  <Text style={styles.fieldLabel}>
+                                    Customer name <Text style={styles.required}>*</Text>
+                                  </Text>
+                                  <View style={styles.inputWrapper}>
+                                    <Icon
+                                      name="account-outline"
+                                      size={18}
+                                      color={colors.textSecondary}
+                                      style={styles.inputIcon}
+                                    />
+                                    <TextInput
+                                      placeholderTextColor={colors.placeholder}
+                                      style={styles.inputWithIcon}
+                                      value={cf.customerName || ''}
+                                      onChangeText={(t) =>
+                                        updateTransferDestinationCustomer(d.tempId, {
+                                          customerName: t,
+                                        })
+                                      }
+                                      placeholder="Full Name"
+                                    />
+                                  </View>
+                                </View>
+
+                                <View style={styles.fieldGroup}>
+                                  <Text style={styles.fieldLabel}>
+                                    Contact number <Text style={styles.required}>*</Text>
+                                  </Text>
+                                  <MobileBoxInput
+                                    value={(cf.customerMobiles || [''])[0] || ''}
+                                    onChange={(t) =>
+                                      updateTransferDestinationCustomer(d.tempId, {
+                                        customerMobiles: [t],
+                                      })
+                                    }
+                                    colors={colors}
+                                    isDark={isDark}
+                                  />
+                                </View>
+
+                                <View style={styles.fieldGroup}>
+                                  <Text style={styles.fieldLabel}>Address</Text>
+                                  <TextInput
+                                    placeholderTextColor={colors.placeholder}
+                                    style={[
+                                      styles.inputWrapper,
+                                      styles.multilineInput,
+                                      { paddingHorizontal: 14 },
+                                    ]}
+                                    value={cf.customerAddress || ''}
+                                    onChangeText={(t) =>
+                                      updateTransferDestinationCustomer(d.tempId, {
+                                        customerAddress: t,
+                                      })
+                                    }
+                                    placeholder="Address (optional)"
+                                    multiline
+                                    numberOfLines={2}
+                                    textAlignVertical="top"
+                                  />
+                                </View>
+
+                                <View style={styles.fieldGroup}>
+                                  <CustomerCategoryField
+                                    value={cf.customerCategory || 'regular'}
+                                    onChange={(v) =>
+                                      updateTransferDestinationCustomer(d.tempId, {
+                                        customerCategory: v,
+                                      })
+                                    }
+                                    label="Customer type"
+                                  />
+                                </View>
+
+                                <View style={styles.fieldGroup}>
+                                  <Text style={styles.fieldLabel}>
+                                    Payment mode <Text style={styles.required}>*</Text>
+                                  </Text>
+                                  <View style={styles.pillRow}>
+                                    {PAYMENT_MODES.map((mode) => {
+                                      const sel = (cf.paymentMode || '') === mode;
+                                      return (
+                                        <TouchableOpacity
+                                          key={mode}
+                                          style={[styles.pill, sel && styles.pillActive]}
+                                          onPress={() =>
+                                            updateTransferDestinationCustomer(d.tempId, {
+                                              paymentMode: mode,
+                                            })
+                                          }
+                                        >
+                                          <Text
+                                            style={[
+                                              styles.pillText,
+                                              sel && styles.pillTextActive,
+                                            ]}
+                                          >
+                                            {mode}
+                                          </Text>
+                                        </TouchableOpacity>
+                                      );
+                                    })}
+                                  </View>
+                                </View>
+
+                                <View style={styles.fieldGroup}>
+                                  <Text style={styles.fieldLabel}>
+                                    Payment to <Text style={styles.required}>*</Text>
+                                  </Text>
+                                  <View style={styles.inputWrapper}>
+                                    <Icon
+                                      name="account-cash-outline"
+                                      size={18}
+                                      color={colors.textSecondary}
+                                      style={styles.inputIcon}
+                                    />
+                                    <TextInput
+                                      placeholderTextColor={colors.placeholder}
+                                      style={styles.inputWithIcon}
+                                      value={cf.paymentTo || ''}
+                                      onChangeText={(t) =>
+                                        updateTransferDestinationCustomer(d.tempId, {
+                                          paymentTo: t,
+                                        })
+                                      }
+                                      placeholder="Owner / receiver name"
+                                    />
+                                  </View>
+                                </View>
+                              </View>
+                            )}
+                          </View>
+                        );
+                      })}
+
+                      <TouchableOpacity
+                        style={styles.transferAddBtn}
+                        onPress={addTransferDestinationRow}
+                        disabled={isSubmitting}
+                      >
+                        <Icon name="map-marker-plus" size={18} color={colors.primary} />
+                        <Text style={[styles.transferAddBtnText, { color: colors.primary }]}>
+                          {hasTransferDestinations
+                            ? 'Pick more destinations on map'
+                            : 'Pick destination plot(s) on map'}
+                        </Text>
+                      </TouchableOpacity>
+                    </View>
+                  )}
 
                   <View style={styles.submitRow}>
                     <TouchableOpacity style={styles.backBtn} onPress={() => setActiveAction(null)}>
                       <Icon name="arrow-left" size={16} color={colors.textSecondary} />
                       <Text style={styles.backBtnText}> Cancel</Text>
                     </TouchableOpacity>
-                    <TouchableOpacity
-                      style={[styles.submitBtn, styles.openBtnSolid]}
-                      onPress={() => handleSubmit('vacant')}
-                      disabled={isSubmitting}
-                    >
-                      {isSubmitting ? (
-                        <ActivityIndicator color="#0f172a" />
-                      ) : (
-                        <Text style={[styles.submitBtnText, styles.submitBtnTextOnYellow]}>Confirm OPEN</Text>
-                      )}
-                    </TouchableOpacity>
+                    {(() => {
+                      // Compute button copy + disabled state from the picked
+                      // mode, so users get clear next-step guidance instead of
+                      // a generic "Confirm OPEN" that would just error out.
+                      let label = 'Confirm OPEN';
+                      let disabled = isSubmitting;
+                      if (needsRefundToOpen && !vacateMode) {
+                        label = 'Pick an option above';
+                        disabled = true;
+                      } else if (
+                        needsRefundToOpen &&
+                        (vacateMode === 'transfer' || vacateMode === 'both') &&
+                        !hasTransferDestinations
+                      ) {
+                        label = 'Add destination plot(s)';
+                        disabled = true;
+                      } else if (hasTransferDestinations) {
+                        label = `Confirm OPEN + Transfer (${vacateTransferDestinations.length})`;
+                      }
+                      return (
+                        <TouchableOpacity
+                          style={[
+                            styles.submitBtn,
+                            styles.openBtnSolid,
+                            disabled && { opacity: 0.5 },
+                          ]}
+                          onPress={() => handleSubmit('vacant')}
+                          disabled={disabled}
+                        >
+                          {isSubmitting ? (
+                            <ActivityIndicator color="#0f172a" />
+                          ) : (
+                            <Text
+                              style={[
+                                styles.submitBtnText,
+                                styles.submitBtnTextOnYellow,
+                              ]}
+                            >
+                              {label}
+                            </Text>
+                          )}
+                        </TouchableOpacity>
+                      );
+                    })()}
                   </View>
-                </>
+                </View>
               )}
-
               {/* Customer Form */}
-              {activeAction && activeAction !== 'vacant' && activeAction !== 'refundOpen' && (
+              {activeAction &&
+                activeAction !== 'vacant' &&
+                activeAction !== 'refundOpen' &&
+                (
                 <>
                   <Text style={styles.sectionLabel}>
                     {activeAction === 'waiting' ? 'Add to Waiting List' : 'Instant Booking'}
                   </Text>
+                  {!readOnlyGuest && (
+                    <TouchableOpacity
+                      style={[
+                        styles.clipboardPasteBar,
+                        { borderColor: colors.border, backgroundColor: isDark ? '#1e293b' : '#f1f5f9' },
+                      ]}
+                      onPress={() => { void pasteCustomerIntoAddForm(); }}
+                      accessibilityRole="button"
+                      accessibilityLabel="Paste customer details from clipboard"
+                    >
+                      <Icon name="content-paste" size={18} color={colors.primary} />
+                      <Text style={[styles.clipboardPasteBarText, { color: colors.primary }]}>
+                        Paste customer details
+                      </Text>
+                    </TouchableOpacity>
+                  )}
 
                   {/* Name */}
                   <View style={styles.fieldGroup}>
@@ -2117,6 +3933,52 @@ const BookingModal = ({
                     <CustomerCategoryField value={customerCategory} onChange={setCustomerCategory} />
                   </View>
 
+                  {activeAction === 'booked' &&
+                  isBulk &&
+                  selectedPlots.length > 1 &&
+                  normalizeCustomerCategory(customerCategory) === 'scholar' ? (
+                    <View
+                      style={[
+                        styles.scholarBulkBanner,
+                        {
+                          borderColor: isDark ? '#059669' : '#a7f3d0',
+                          backgroundColor: isDark ? 'rgba(5, 150, 105, 0.14)' : '#ecfdf5',
+                        },
+                      ]}
+                    >
+                      <Icon name="school" size={22} color="#059669" />
+                      <View style={styles.scholarBulkBannerTextCol}>
+                        <Text
+                          style={[styles.scholarBulkBannerTitle, { color: isDark ? '#a7f3d0' : '#065f46' }]}
+                        >
+                          Scholar rate on one plot only
+                        </Text>
+                        <Text style={[styles.scholarBulkBannerSub, { color: colors.textSecondary }]}>
+                          Plot No.{' '}
+                          <Text style={{ fontWeight: '800', color: colors.text }}>
+                            {selectedPlots.find((p) => String(p._id) === String(scholarDiscountPlotId))
+                              ?.plotNumber ?? '—'}
+                          </Text>{' '}
+                          uses Alim / Hafiz advance in the confirmation; other plots use regular pricing.
+                        </Text>
+                      </View>
+                      <TouchableOpacity
+                        onPress={() => setScholarPlotPickerVisible(true)}
+                        style={[
+                          styles.scholarBulkChangeBtn,
+                          { borderColor: isDark ? '#059669' : '#34d399' },
+                        ]}
+                        accessibilityLabel="Choose which plot gets Alim Hafiz pricing"
+                      >
+                        <Text
+                          style={[styles.scholarBulkChangeBtnText, { color: isDark ? '#a7f3d0' : '#047857' }]}
+                        >
+                          Change
+                        </Text>
+                      </TouchableOpacity>
+                    </View>
+                  ) : null}
+
                   {/* Photo */}
                   <View style={styles.fieldGroup}>
                     <Text style={styles.fieldLabel}>Customer Photo <Text style={styles.optional}>(Optional)</Text></Text>
@@ -2165,6 +4027,12 @@ const BookingModal = ({
                       {/* Amount */}
                       <View style={styles.fieldGroup}>
                         <Text style={styles.fieldLabel}>Advance / Booking Amount <Text style={styles.required}>*</Text></Text>
+                        {isBulk && selectedPlots.length > 1 ? (
+                          <Text style={[styles.fieldHint, { color: colors.textSecondary }]}>
+                            Enter the total received for all {selectedPlots.length} plots. On submit, choose whether to
+                            split it equally per plot or store the full amount on each.
+                          </Text>
+                        ) : null}
                         <View style={styles.inputWrapper}>
                           <Text style={styles.currencySymbol}>Rs.</Text>
                           <TextInput
@@ -2240,6 +4108,27 @@ const BookingModal = ({
                           </View>
                         </View>
                       )}
+
+                      <TouchableOpacity
+                        style={styles.fullAdvanceRow}
+                        onPress={() =>
+                          confirmFullAdvanceToggle(!fullAdvanceReceived, {
+                            advanceInput: advanceAmount,
+                            categoryForPricing: customerCategory,
+                          })
+                        }
+                        activeOpacity={0.85}
+                        accessibilityRole="checkbox"
+                        accessibilityState={{ checked: fullAdvanceReceived }}
+                        accessibilityLabel={COMPLETE_ADVANCE_RECEIVED_LABEL}
+                      >
+                        <Icon
+                          name={fullAdvanceReceived ? 'checkbox-marked-circle' : 'checkbox-blank-circle-outline'}
+                          size={20}
+                          color={fullAdvanceReceived ? '#2563eb' : colors.textSecondary}
+                        />
+                        <Text style={styles.fullAdvanceText}>{COMPLETE_ADVANCE_RECEIVED_LABEL}</Text>
+                      </TouchableOpacity>
 
                       {/* Remarks */}
                       <View style={styles.fieldGroup}>
@@ -2326,7 +4215,7 @@ const BookingModal = ({
                         </Text>
                       </TouchableOpacity>
                     )}
-                    {showWaitlistAndBook && (
+                    {showFinalBookingQuickAction && (
                       <TouchableOpacity style={[styles.actionBtn, styles.bookedBtn]} onPress={onPressFinal}>
                         <Icon name="check-circle-outline" size={18} color="#fff" />
                         <Text style={styles.actionBtnText} numberOfLines={1}>Final</Text>
@@ -2420,6 +4309,66 @@ const BookingModal = ({
     </Modal>
 
     <Modal
+      visible={scholarPlotPickerVisible}
+      transparent
+      animationType="fade"
+      onRequestClose={() => setScholarPlotPickerVisible(false)}
+    >
+      <Pressable style={styles.scholarPickerOverlay} onPress={() => setScholarPlotPickerVisible(false)}>
+        <Pressable
+          style={[styles.scholarPickerSheet, { backgroundColor: colors.surface, borderColor: colors.border }]}
+          onPress={(e) => e.stopPropagation()}
+        >
+          <View style={styles.scholarPickerHeader}>
+            <Icon name="school" size={24} color="#7c3aed" />
+            <Text style={[styles.scholarPickerTitle, { color: colors.text }]}>Apply scholar rate</Text>
+          </View>
+          <Text style={[styles.scholarPickerSubtitle, { color: colors.textSecondary }]}>
+            Discount applies to only 1 plot. Choose which plot should use Alim / Hafiz advance in confirmations:
+          </Text>
+          <ScrollView style={styles.scholarPickerList} keyboardShouldPersistTaps="handled">
+            {selectedPlots.map((p) => {
+              const isActive = String(scholarDiscountPlotId) === String(p._id);
+              return (
+                <TouchableOpacity
+                  key={String(p._id)}
+                  style={[
+                    styles.scholarPickerItem,
+                    { borderColor: colors.border, backgroundColor: isDark ? colors.background : '#f8fafc' },
+                    isActive && {
+                      borderColor: colors.primary,
+                      backgroundColor: isDark ? 'rgba(59, 130, 246, 0.12)' : '#eff6ff',
+                    },
+                  ]}
+                  onPress={() => {
+                    setScholarDiscountPlotId(String(p._id));
+                    setScholarPlotPickerVisible(false);
+                  }}
+                >
+                  <View>
+                    <Text style={[styles.scholarPickerPlotNo, { color: colors.text }]}>
+                      Plot No. {p.plotNumber}
+                    </Text>
+                    <Text style={[styles.scholarPickerArea, { color: colors.textSecondary }]}>
+                      {p.areaSqFt ? `${Number(p.areaSqFt).toLocaleString('en-IN')} sq ft` : '—'}
+                    </Text>
+                  </View>
+                  {isActive ? <Icon name="check-circle" size={24} color="#059669" /> : null}
+                </TouchableOpacity>
+              );
+            })}
+          </ScrollView>
+          <TouchableOpacity
+            style={styles.scholarPickerCancel}
+            onPress={() => setScholarPlotPickerVisible(false)}
+          >
+            <Text style={[styles.scholarPickerCancelText, { color: colors.textSecondary }]}>Cancel</Text>
+          </TouchableOpacity>
+        </Pressable>
+      </Pressable>
+    </Modal>
+
+    <Modal
       visible={Boolean(plot?._id && (editWaiterId || editBookingOpen))}
       transparent
       animationType="fade"
@@ -2436,6 +4385,23 @@ const BookingModal = ({
                 ? 'Update customer, advance, payment, address, and notes for this booking.'
                 : 'Same layout as Add Waiting — add/remove rows for extra numbers (up to 5).'}
             </Text>
+            {!readOnlyGuest && (
+              <TouchableOpacity
+                style={[
+                  styles.clipboardPasteBar,
+                  { borderColor: colors.border, backgroundColor: isDark ? '#1e293b' : '#f1f5f9' },
+                ]}
+                onPress={() => { void pasteCustomerIntoEditSheet(); }}
+                disabled={isEditingWaiter || isSavingBookingEdit}
+                accessibilityRole="button"
+                accessibilityLabel="Paste customer details from clipboard"
+              >
+                <Icon name="content-paste" size={18} color={colors.primary} />
+                <Text style={[styles.clipboardPasteBarText, { color: colors.primary }]}>
+                  Paste customer details
+                </Text>
+              </TouchableOpacity>
+            )}
 
             <ScrollView
               keyboardShouldPersistTaps="handled"
@@ -2670,6 +4636,15 @@ const BookingModal = ({
         </KeyboardAvoidingView>
       </View>
     </Modal>
+
+    <RecordPaymentMarkCompleteModal
+      visible={recordPaymentModalVisible}
+      onRequestClose={closeRecordPaymentModal}
+      summaryRow={recordPaymentSummaryRow}
+      submitting={recordPaymentSubmitting}
+      submittingAction={recordPaymentSubmittingAction}
+      onConfirm={submitRecordPaymentFromModal}
+    />
     </>
   );
 };
@@ -2713,11 +4688,16 @@ const getStyles = (colors, isDark) => StyleSheet.create({
     letterSpacing: 0.2,
   },
   statusBadge: {
-    marginTop: 6,
     alignSelf: 'flex-start',
     paddingHorizontal: 12,
     paddingVertical: 3,
     borderRadius: 20,
+  },
+  statusRow: {
+    marginTop: 6,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
   },
   statusBadgeText: {
     fontWeight: '700',
@@ -2910,6 +4890,21 @@ const getStyles = (colors, isDark) => StyleSheet.create({
   },
   queueActionIcons: { flexDirection: 'row', alignItems: 'center', gap: 2 },
   queueIconBtn: { padding: 8, borderRadius: 12 },
+  clipboardPasteBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    alignSelf: 'flex-start',
+    marginBottom: 14,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: 10,
+    borderWidth: 1,
+  },
+  clipboardPasteBarText: {
+    fontSize: 14,
+    fontWeight: '700',
+  },
   queueInlineCall: {
     minWidth: 48,
     minHeight: 48,
@@ -2925,6 +4920,20 @@ const getStyles = (colors, isDark) => StyleSheet.create({
     borderTopWidth: StyleSheet.hairlineWidth,
     borderTopColor: colors.border,
     gap: 6,
+  },
+  queuePaymentHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 10,
+    marginBottom: 4,
+  },
+  queuePaymentMarkBtn: {
+    padding: 6,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: isDark ? 'rgba(5, 150, 105, 0.45)' : '#a7f3d0',
+    backgroundColor: isDark ? 'rgba(5, 150, 105, 0.12)' : '#ecfdf5',
   },
   queuePaymentText: {
     fontSize: 14,
@@ -2980,8 +4989,8 @@ const getStyles = (colors, isDark) => StyleSheet.create({
     justifyContent: 'center',
     gap: 4,
     paddingVertical: 6,
-    paddingHorizontal: 6,
-    width: 52,
+    paddingHorizontal: 8,
+    width: 76,
     alignSelf: 'stretch',
     borderRadius: 10,
     borderWidth: 1.5,
@@ -2994,6 +5003,8 @@ const getStyles = (colors, isDark) => StyleSheet.create({
     fontWeight: '800',
     color: isDark ? '#81c784' : '#1b5e20',
     letterSpacing: 0.2,
+    textAlign: 'center',
+    lineHeight: 14,
   },
   queueImagePreviewBackdrop: {
     flex: 1,
@@ -3016,6 +5027,62 @@ const getStyles = (colors, isDark) => StyleSheet.create({
     textAlign: 'center',
     paddingHorizontal: 16,
   },
+
+  scholarBulkBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    paddingVertical: 12,
+    paddingHorizontal: 12,
+    borderRadius: 14,
+    borderWidth: 1.5,
+    marginBottom: 14,
+  },
+  scholarBulkBannerTextCol: { flex: 1, minWidth: 0 },
+  scholarBulkBannerTitle: { fontSize: 13, fontWeight: '800' },
+  scholarBulkBannerSub: { fontSize: 12, lineHeight: 17, marginTop: 3 },
+  scholarBulkChangeBtn: {
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderRadius: 10,
+    borderWidth: 1.5,
+    flexShrink: 0,
+  },
+  scholarBulkChangeBtnText: { fontSize: 12, fontWeight: '800' },
+
+  scholarPickerOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.55)',
+    justifyContent: 'center',
+    paddingHorizontal: 20,
+  },
+  scholarPickerSheet: {
+    borderRadius: 16,
+    borderWidth: 1,
+    padding: 18,
+    maxHeight: '78%',
+    width: '100%',
+    maxWidth: 420,
+    alignSelf: 'center',
+  },
+  scholarPickerHeader: { flexDirection: 'row', alignItems: 'center', gap: 10, marginBottom: 8 },
+  scholarPickerTitle: { fontSize: 17, fontWeight: '800' },
+  scholarPickerSubtitle: { fontSize: 13, lineHeight: 19, marginBottom: 12 },
+  scholarPickerList: { maxHeight: 340 },
+  scholarPickerItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: 12,
+    paddingHorizontal: 12,
+    borderRadius: 12,
+    borderWidth: 1.5,
+    marginBottom: 8,
+  },
+  scholarPickerPlotNo: { fontSize: 16, fontWeight: '800' },
+  scholarPickerArea: { fontSize: 12, marginTop: 2 },
+  scholarPickerCancel: { paddingVertical: 12, alignItems: 'center', marginTop: 4 },
+  scholarPickerCancelText: { fontSize: 15, fontWeight: '700' },
 
   transferPanel: {
     borderWidth: 1.5,
@@ -3171,12 +5238,112 @@ const getStyles = (colors, isDark) => StyleSheet.create({
     marginBottom: 12,
     marginLeft: 4,
   },
+  // Mode picker shown when starting OPEN on a booked plot. Three stacked
+  // actions with distinct colours before any inputs appear.
+  vacateModeBox: {
+    marginBottom: 14,
+    padding: 12,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: isDark ? '#0f172a' : '#f8fafc',
+  },
+  vacateModeLabel: {
+    fontSize: 13,
+    fontWeight: '800',
+    color: colors.text,
+    marginBottom: 10,
+  },
+  // Stacked full-width buttons so long labels wrap without truncation.
+  vacateModeRow: {
+    flexDirection: 'column',
+    gap: 10,
+  },
+  vacateModeBtn: {
+    width: '100%',
+    alignSelf: 'stretch',
+    paddingVertical: 12,
+    paddingHorizontal: 14,
+    borderRadius: 12,
+    borderWidth: 2,
+    alignItems: 'center',
+    justifyContent: 'center',
+    minHeight: 48,
+  },
+  /** Complete Refund — green */
+  vacateModeBtnRefund: {
+    borderColor: isDark ? '#047857' : '#34d399',
+    backgroundColor: isDark ? '#064e3b' : '#ecfdf5',
+  },
+  vacateModeBtnRefundActive: {
+    borderColor: isDark ? '#34d399' : '#059669',
+    backgroundColor: isDark ? '#065f46' : '#d1fae5',
+  },
+  vacateModeBtnTextRefund: {
+    color: isDark ? '#a7f3d0' : '#065f46',
+  },
+  vacateModeBtnTextRefundActive: {
+    color: isDark ? '#ecfdf5' : '#064e3b',
+  },
+  /** Amount transfer — indigo */
+  vacateModeBtnTransfer: {
+    borderColor: isDark ? '#6366f1' : '#818cf8',
+    backgroundColor: isDark ? '#1e1b4b' : '#eef2ff',
+  },
+  vacateModeBtnTransferActive: {
+    borderColor: isDark ? '#a5b4fc' : '#4f46e5',
+    backgroundColor: isDark ? '#312e81' : '#e0e7ff',
+  },
+  vacateModeBtnTextTransfer: {
+    color: isDark ? '#c7d2fe' : '#3730a3',
+  },
+  vacateModeBtnTextTransferActive: {
+    color: isDark ? '#eef2ff' : '#1e1b4b',
+  },
+  /** Partial refund + transfer — amber */
+  vacateModeBtnBoth: {
+    borderColor: isDark ? '#f59e0b' : '#fbbf24',
+    backgroundColor: isDark ? '#78350f' : '#fffbeb',
+  },
+  vacateModeBtnBothActive: {
+    borderColor: isDark ? '#fcd34d' : '#d97706',
+    backgroundColor: isDark ? '#92400e' : '#fef3c7',
+  },
+  vacateModeBtnTextBoth: {
+    color: isDark ? '#fde68a' : '#92400e',
+  },
+  vacateModeBtnTextBothActive: {
+    color: isDark ? '#fffbeb' : '#78350f',
+  },
+  vacateModeBtnLabel: {
+    fontSize: 13,
+    fontWeight: '700',
+    textAlign: 'center',
+    lineHeight: 18,
+    flexShrink: 1,
+    width: '100%',
+    alignSelf: 'stretch',
+  },
+  vacateModeHint: {
+    marginTop: 8,
+    fontSize: 12,
+    color: colors.textSecondary,
+    fontStyle: 'italic',
+  },
   waitingBtn: { backgroundColor: '#ffeb3b' },
   bookedBtn: { backgroundColor: '#2e7d32' },
   bmBtn: { backgroundColor: '#0ea5e9' },
   
   fieldGroup: { marginBottom: 18 },
   fieldLabel: { fontSize: 13, fontWeight: '800', color: colors.text, marginBottom: 8, marginLeft: 2 },
+  fieldHint: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: colors.textSecondary,
+    marginBottom: 8,
+    marginLeft: 2,
+    lineHeight: 17,
+  },
   required: { color: '#d32f2f' },
   optional: { fontWeight: '400', color: colors.textSecondary, fontSize: 11 },
   inputWrapper: {
@@ -3276,6 +5443,192 @@ const getStyles = (colors, isDark) => StyleSheet.create({
     borderWidth: 1,
     borderColor: isDark ? '#334155' : '#e8efff',
   },
+  transferCard: {
+    backgroundColor: isDark ? '#1e1b4b' : '#f5f3ff',
+    borderRadius: 18,
+    padding: 16,
+    marginBottom: 12,
+    borderWidth: 1,
+    borderColor: isDark ? '#4338ca' : '#ddd6fe',
+  },
+  transferHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 8,
+  },
+  transferHeader: {
+    fontWeight: '900',
+    fontSize: 16,
+    color: colors.text,
+    letterSpacing: 0.4,
+    flex: 1,
+  },
+  transferActiveBadge: {
+    paddingHorizontal: 10,
+    paddingVertical: 3,
+    borderRadius: 999,
+    backgroundColor: isDark ? '#4338ca' : '#7c3aed',
+  },
+  transferActiveBadgeText: {
+    color: '#fff',
+    fontSize: 11,
+    fontWeight: '800',
+    letterSpacing: 0.4,
+  },
+  transferIntro: {
+    color: colors.textSecondary,
+    fontSize: 12,
+    fontWeight: '600',
+    marginBottom: 10,
+    lineHeight: 17,
+  },
+  transferTotalsBox: {
+    backgroundColor: isDark ? 'rgba(255,255,255,0.04)' : '#fff',
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderWidth: 1,
+    borderColor: isDark ? '#3730a3' : '#e9d5ff',
+    marginBottom: 12,
+  },
+  transferTotalsRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingVertical: 3,
+  },
+  transferTotalsRowEm: {
+    borderTopWidth: 1,
+    borderTopColor: isDark ? '#3730a3' : '#e9d5ff',
+    marginTop: 4,
+    paddingTop: 6,
+  },
+  transferTotalsLabel: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: colors.textSecondary,
+  },
+  transferTotalsValue: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: colors.text,
+  },
+  transferTotalsLabelEm: {
+    fontSize: 13,
+    fontWeight: '800',
+    color: colors.text,
+  },
+  transferTotalsValueEm: {
+    fontSize: 14,
+    fontWeight: '900',
+    color: '#7c3aed',
+  },
+  transferSplitHint: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: colors.textSecondary,
+    marginTop: 6,
+    fontStyle: 'italic',
+  },
+  transferDestCard: {
+    borderWidth: 1,
+    borderColor: isDark ? '#3730a3' : '#c4b5fd',
+    borderRadius: 14,
+    padding: 12,
+    marginBottom: 10,
+    backgroundColor: isDark ? 'rgba(124,58,237,0.07)' : '#fff',
+  },
+  transferDestHeader: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+  },
+  transferDestTitleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flexWrap: 'wrap',
+    gap: 6,
+    marginBottom: 4,
+  },
+  transferDestTitle: {
+    fontWeight: '900',
+    fontSize: 15,
+    color: colors.text,
+  },
+  transferDestStatusPill: {
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    borderRadius: 999,
+  },
+  transferDestStatusPillText: {
+    fontSize: 10,
+    fontWeight: '900',
+    letterSpacing: 0.5,
+  },
+  transferBluePredict: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 7,
+    paddingVertical: 2,
+    borderRadius: 999,
+    backgroundColor: isDark ? 'rgba(21,101,192,0.18)' : '#e3f2fd',
+    gap: 3,
+  },
+  transferBluePredictText: {
+    color: '#1565c0',
+    fontWeight: '800',
+    fontSize: 10,
+  },
+  transferDestSlice: {
+    fontSize: 13,
+    fontWeight: '800',
+    color: '#7c3aed',
+    marginTop: 2,
+  },
+  transferDestActionLine: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: colors.textSecondary,
+    marginTop: 4,
+    lineHeight: 16,
+  },
+  transferDestRemoveBtn: {
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: isDark ? 'rgba(220,38,38,0.18)' : '#fee2e2',
+    marginLeft: 6,
+  },
+  transferCustForm: {
+    marginTop: 10,
+    paddingTop: 10,
+    borderTopWidth: 1,
+    borderTopColor: isDark ? '#3730a3' : '#e9d5ff',
+  },
+  transferCustFormHint: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: colors.textSecondary,
+    marginBottom: 8,
+    fontStyle: 'italic',
+  },
+  transferAddBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+    paddingVertical: 12,
+    borderRadius: 12,
+    borderWidth: 1.5,
+    borderStyle: 'dashed',
+    borderColor: isDark ? '#7c3aed' : '#a78bfa',
+    backgroundColor: isDark ? 'rgba(124,58,237,0.10)' : 'rgba(124,58,237,0.06)',
+  },
+  transferAddBtnText: {
+    fontWeight: '800',
+    fontSize: 13,
+  },
   paymentHeaderRow: { flexDirection: 'row', alignItems: 'center', marginBottom: 20 },
   paymentHeader: {
     fontWeight: '900',
@@ -3294,6 +5647,18 @@ const getStyles = (colors, isDark) => StyleSheet.create({
   pillActive: { borderColor: '#1a1a2e', backgroundColor: '#1a1a2e' },
   pillText: { fontSize: 13, color: colors.textSecondary, fontWeight: '700' },
   pillTextActive: { color: '#f8fafc' },
+  fullAdvanceRow: {
+    marginTop: 8,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    paddingVertical: 6,
+  },
+  fullAdvanceText: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: colors.text,
+  },
   multilineInput: {
     minHeight: 100,
     paddingTop: 14,

@@ -90,6 +90,20 @@ android {
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 1
         versionName "1.0"
+        // Required for react-native-config when using appId/appIdSuffix flavors.
+        // BuildConfig class stays under namespace package, not flavored applicationId.
+        resValue "string", "build_config_package", "com.frontend"
+    }
+    flavorDimensions "environment"
+    productFlavors {
+        prod {
+            dimension "environment"
+            applicationId "com.frontend"
+        }
+        dev {
+            dimension "environment"
+            applicationIdSuffix ".dev"
+        }
     }
     signingConfigs {
         debug {
@@ -130,7 +144,9 @@ dependencies {
 //   debug   = Metro + npm run android + Android Studio Run (default) → ../.env (local API)
 //   release = ./gradlew assembleRelease / bundleRelease → ../.env.production (Render)
 project.ext.envConfigFiles = [
-    debug  : "../.env",
-    release: "../.env.production",
+    devdebug    : "../.env",
+    devrelease  : "../.env",
+    proddebug   : "../.env.production",
+    prodrelease : "../.env.production",
 ]
 apply from: file("../../node_modules/react-native-config/android/dotenv.gradle")

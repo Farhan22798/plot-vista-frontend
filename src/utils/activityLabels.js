@@ -3,6 +3,8 @@ export function displayActivityAction(action, newStatus) {
   if (action === 'Marked Vacant') return 'OPEN';
   if (action === 'Updated Waiter') return 'Updated Waiting Details';
   if (action === 'Updated Booking') return 'Updated Booking Details';
+  if (action === 'Marked Full Advance Received') return 'Full Advance Received';
+  if (action === 'Unmarked Full Advance Received') return 'Full Advance Unmarked';
   if (action === 'Added Waiting Note') return 'Waiting — note added';
   if (action === 'Updated Waiting Note') return 'Waiting — note updated';
   if (action === 'Added Booking Note') return 'Booking — note added';

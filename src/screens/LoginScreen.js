@@ -26,7 +26,6 @@ import {
   getBiometricCredentials,
   isBiometricEnabled,
 } from '../utils/biometricAuth';
-
 const BIOMETRY_ICONS = {
   FaceID: 'face',
   TouchID: 'fingerprint',
@@ -40,11 +39,28 @@ const LoginScreen = ({ navigation }) => {
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [forgotOpen, setForgotOpen] = useState(false);
-  const { login, isLoading } = useContext(AuthContext);
+  const { login, verifyLoginOtp, resendLoginOtp, isLoading } = useContext(AuthContext);
   const { showAlert } = useAlert();
 
   const [biometricReady, setBiometricReady] = useState(false);
   const [biometryType, setBiometryType] = useState(null);
+
+  /**
+   * OTP step state — populated when /auth/login responds with otpRequired:true.
+   * Holding `password` here lets us save biometric credentials only AFTER the
+   * OTP step completes successfully (so a leaked password that never clears
+   * OTP can't get cached for fingerprint use).
+   */
+  const [otpStep, setOtpStep] = useState(null); // { loginChallengeId, emailHint, mobileNumber, password, expiresInSec }
+  const [otpCode, setOtpCode] = useState('');
+  const [otpSubmitting, setOtpSubmitting] = useState(false);
+  const [otpResending, setOtpResending] = useState(false);
+  const [otpResendCooldown, setOtpResendCooldown] = useState(0);
+  // Local in-flight flag for the password login (and biometric login) button.
+  // We can't use AuthContext.isLoading anymore — toggling that mid-action
+  // would unmount the screen (NavigationWrapper renders only a spinner when
+  // it's true) and lose `otpStep`. Local state keeps the screen mounted.
+  const [submitting, setSubmitting] = useState(false);
 
   useEffect(() => {
     (async () => {
@@ -60,7 +76,28 @@ const LoginScreen = ({ navigation }) => {
     })();
   }, []);
 
+  // Tick down the resend-cooldown each second so the user sees when they can retry.
+  useEffect(() => {
+    if (otpResendCooldown <= 0) return undefined;
+    const t = setTimeout(() => setOtpResendCooldown((s) => Math.max(0, s - 1)), 1000);
+    return () => clearTimeout(t);
+  }, [otpResendCooldown]);
+
+  /**
+   * Saves biometric credentials only after a fully successful login (post-OTP
+   * if needed). Wrapping in a try/catch + microtask so this never blocks the
+   * UI or surfaces errors — the screen is unmounting at this point.
+   */
+  const tryPersistBiometric = useCallback(async (mobile, plainPassword) => {
+    try {
+      const { available } = await isBiometricAvailable();
+      if (!available) return;
+      saveBiometricCredentials(mobile, plainPassword).catch(() => {});
+    } catch (_) {}
+  }, []);
+
   const handleBiometricLogin = useCallback(async () => {
+    if (submitting) return;
     try {
       const creds = await getBiometricCredentials();
       if (!creds) {
@@ -69,13 +106,32 @@ const LoginScreen = ({ navigation }) => {
       }
       const ok = await promptBiometric('Log in to Plot Vista');
       if (!ok) return;
-      await login(creds.mobile, creds.password);
+      setSubmitting(true);
+      // Biometric uses saved credentials. The `login()` helper attaches the
+      // device trust token automatically, so the server skips OTP. If for any
+      // reason the trust token is missing (e.g. cleared storage), the user
+      // will be taken through the OTP step — which is the correct conservative
+      // fallback.
+      const result = await login(creds.mobile, creds.password);
+      if (result?.otpRequired) {
+        setOtpStep({
+          loginChallengeId: result.loginChallengeId,
+          emailHint: result.emailHint,
+          mobileNumber: result.mobileNumber,
+          password: result.password,
+          expiresInSec: result.expiresInSec,
+        });
+        setOtpResendCooldown(60);
+      }
     } catch (e) {
       showAlert('Login failed', e.response?.data?.message || 'Biometric login failed. Try password.');
+    } finally {
+      setSubmitting(false);
     }
-  }, [login, showAlert]);
+  }, [login, showAlert, submitting]);
 
   const handleLogin = async () => {
+    if (submitting) return;
     if (!mobileNumber || !password) {
       showAlert('Error', 'Please fill in all fields');
       return;
@@ -85,22 +141,79 @@ const LoginScreen = ({ navigation }) => {
       return;
     }
     try {
-      // Check biometric support BEFORE login — login() sets the token which
-      // unmounts this screen, so any code after it won't run.
-      const { available: bioAvail } = await isBiometricAvailable();
+      setSubmitting(true);
+      const result = await login(mobileNumber.trim(), password);
 
-      await login(mobileNumber.trim(), password);
-
-      // login() succeeded — if biometrics are available, silently save
-      // credentials so the fingerprint button appears next time.
-      // This runs in a microtask; even if the component unmounts, the
-      // AsyncStorage write still completes.
-      if (bioAvail) {
-        saveBiometricCredentials(mobileNumber.trim(), password).catch(() => {});
+      if (result?.otpRequired) {
+        // Move to OTP step. Don't save biometric creds yet — only after OTP success.
+        setOtpStep({
+          loginChallengeId: result.loginChallengeId,
+          emailHint: result.emailHint,
+          mobileNumber: result.mobileNumber,
+          password: result.password,
+          expiresInSec: result.expiresInSec,
+        });
+        setOtpCode('');
+        setOtpResendCooldown(60);
+        return;
       }
+
+      // Direct login (trusted device or legacy no-email account) — safe to
+      // persist biometric credentials immediately.
+      tryPersistBiometric(mobileNumber.trim(), password);
     } catch (e) {
       showAlert('Login failed', e.response?.data?.message || 'Something went wrong');
+    } finally {
+      setSubmitting(false);
     }
+  };
+
+  const handleVerifyOtp = async () => {
+    if (!otpStep?.loginChallengeId) return;
+    const code = otpCode.trim();
+    if (!/^\d{6}$/.test(code)) {
+      showAlert('Code required', 'Enter the 6-digit code sent to your email.');
+      return;
+    }
+    try {
+      setOtpSubmitting(true);
+      await verifyLoginOtp(otpStep.loginChallengeId, code, otpStep.mobileNumber);
+      // OTP cleared — now it's safe to save biometric creds (this device is trusted).
+      tryPersistBiometric(otpStep.mobileNumber, otpStep.password);
+    } catch (e) {
+      showAlert(
+        'Verification failed',
+        e.response?.data?.message || 'Could not verify the code. Try again.',
+      );
+    } finally {
+      setOtpSubmitting(false);
+    }
+  };
+
+  const handleResendOtp = async () => {
+    if (!otpStep?.loginChallengeId || otpResendCooldown > 0) return;
+    try {
+      setOtpResending(true);
+      const data = await resendLoginOtp(otpStep.loginChallengeId);
+      setOtpResendCooldown(60);
+      showAlert(
+        'Code sent',
+        `A new 6-digit code was sent to ${data?.emailHint || otpStep.emailHint || 'your email'}.`,
+      );
+    } catch (e) {
+      const msg = e.response?.data?.message || 'Could not resend the code.';
+      showAlert('Resend failed', msg);
+    } finally {
+      setOtpResending(false);
+    }
+  };
+
+  const cancelOtpStep = () => {
+    setOtpStep(null);
+    setOtpCode('');
+    setOtpSubmitting(false);
+    setOtpResending(false);
+    setOtpResendCooldown(0);
   };
 
   return (
@@ -119,94 +232,167 @@ const LoginScreen = ({ navigation }) => {
             <Text style={styles.tagline}>{SITE_TAGLINE}</Text>
             <Text style={styles.brand}>{SITE_NAME}</Text>
             <View style={styles.rule} />
-            <Text style={styles.screenTitle}>Sign in</Text>
+            <Text style={styles.screenTitle}>{otpStep ? 'Verify it\u2019s you' : 'Sign in'}</Text>
             <Text style={styles.subtitle}>
-              Use your registered mobile number and password.
+              {otpStep
+                ? `For your security, enter the 6-digit code we sent to ${otpStep.emailHint || 'your email'}.`
+                : 'Use your registered mobile number and password.'}
             </Text>
           </View>
 
-          <View style={styles.card}>
-            <View style={styles.inputContainer}>
-              <Text style={styles.label}>Mobile number</Text>
-              <MobileBoxInput
-                value={mobileNumber}
-                onChange={setMobileNumber}
-                colors={colors}
-                isDark={isDark}
-              />
-            </View>
-
-            <View style={styles.inputContainer}>
-              <Text style={styles.label}>Password</Text>
-              <View style={styles.passwordRow}>
-                <TextInput
-                  placeholderTextColor={colors.placeholder}
-                  style={styles.passwordInput}
-                  placeholder="Enter password"
-                  value={password}
-                  onChangeText={setPassword}
-                  secureTextEntry={!showPassword}
+          {!otpStep ? (
+            <View style={styles.card}>
+              <View style={styles.inputContainer}>
+                <Text style={styles.label}>Mobile number</Text>
+                <MobileBoxInput
+                  value={mobileNumber}
+                  onChange={setMobileNumber}
+                  colors={colors}
+                  isDark={isDark}
                 />
-                <TouchableOpacity
-                  style={styles.eyeButton}
-                  onPress={() => setShowPassword((v) => !v)}
-                  accessibilityRole="button"
-                  accessibilityLabel={showPassword ? 'Hide password' : 'Show password'}
-                >
-                  <Icon
-                    name={showPassword ? 'visibility-off' : 'visibility'}
-                    size={22}
-                    color={colors.textSecondary}
-                  />
-                </TouchableOpacity>
               </View>
-              <TouchableOpacity
-                onPress={() => setForgotOpen(true)}
-                style={styles.forgotLinkWrap}
-                accessibilityRole="button"
-                accessibilityLabel="Forgot password"
-              >
-                <Text style={styles.forgotLink}>Forgot password?</Text>
-              </TouchableOpacity>
-            </View>
 
-            {isLoading ? (
-              <ActivityIndicator
-                size="large"
-                color={colors.primary}
-                style={styles.spinner}
-              />
-            ) : (
-              <>
-                <TouchableOpacity style={styles.button} onPress={handleLogin}>
-                  <Text style={styles.buttonText}>Log in</Text>
-                </TouchableOpacity>
-
-                {biometricReady && (
+              <View style={styles.inputContainer}>
+                <Text style={styles.label}>Password</Text>
+                <View style={styles.passwordRow}>
+                  <TextInput
+                    placeholderTextColor={colors.placeholder}
+                    style={styles.passwordInput}
+                    placeholder="Enter password"
+                    value={password}
+                    onChangeText={setPassword}
+                    secureTextEntry={!showPassword}
+                  />
                   <TouchableOpacity
-                    style={styles.biometricBtn}
-                    onPress={handleBiometricLogin}
+                    style={styles.eyeButton}
+                    onPress={() => setShowPassword((v) => !v)}
                     accessibilityRole="button"
-                    accessibilityLabel="Log in with biometrics"
+                    accessibilityLabel={showPassword ? 'Hide password' : 'Show password'}
                   >
                     <Icon
-                      name={BIOMETRY_ICONS[biometryType] || 'fingerprint'}
-                      size={28}
-                      color={colors.primary}
+                      name={showPassword ? 'visibility-off' : 'visibility'}
+                      size={22}
+                      color={colors.textSecondary}
                     />
-                    <Text style={styles.biometricText}>Use Biometrics</Text>
                   </TouchableOpacity>
-                )}
-              </>
-            )}
-          </View>
+                </View>
+                <TouchableOpacity
+                  onPress={() => setForgotOpen(true)}
+                  style={styles.forgotLinkWrap}
+                  accessibilityRole="button"
+                  accessibilityLabel="Forgot password"
+                >
+                  <Text style={styles.forgotLink}>Forgot password?</Text>
+                </TouchableOpacity>
+              </View>
 
-          <View style={styles.footer}>
-            <Text style={styles.footerText}>No account yet? </Text>
-            <TouchableOpacity onPress={() => navigation.navigate('Signup')}>
-              <Text style={styles.linkText}>Create one</Text>
-            </TouchableOpacity>
-          </View>
+              <TouchableOpacity
+                style={[styles.button, submitting && styles.buttonDisabled]}
+                onPress={handleLogin}
+                disabled={submitting}
+                accessibilityState={{ busy: submitting, disabled: submitting }}
+              >
+                {submitting ? (
+                  <View style={styles.buttonContentRow}>
+                    <ActivityIndicator size="small" color="#fff" />
+                    <Text style={[styles.buttonText, styles.buttonTextWithSpinner]}>
+                      Signing in…
+                    </Text>
+                  </View>
+                ) : (
+                  <Text style={styles.buttonText}>Log in</Text>
+                )}
+              </TouchableOpacity>
+
+              {biometricReady && (
+                <TouchableOpacity
+                  style={[styles.biometricBtn, submitting && styles.buttonDisabled]}
+                  onPress={handleBiometricLogin}
+                  disabled={submitting}
+                  accessibilityRole="button"
+                  accessibilityLabel="Log in with biometrics"
+                >
+                  <Icon
+                    name={BIOMETRY_ICONS[biometryType] || 'fingerprint'}
+                    size={28}
+                    color={colors.primary}
+                  />
+                  <Text style={styles.biometricText}>Use Biometrics</Text>
+                </TouchableOpacity>
+              )}
+            </View>
+          ) : (
+            <View style={styles.card}>
+              <View style={styles.otpHintBox}>
+                <Icon name="mark-email-read" size={20} color={colors.primary} />
+                <Text style={styles.otpHintText}>
+                  Code sent to <Text style={styles.otpHintEmail}>{otpStep.emailHint || 'your email'}</Text>.
+                  This step happens only on a new device.
+                </Text>
+              </View>
+
+              <View style={styles.inputContainer}>
+                <Text style={styles.label}>6-digit code</Text>
+                <TextInput
+                  placeholderTextColor={colors.placeholder}
+                  style={styles.otpInput}
+                  placeholder="••••••"
+                  value={otpCode}
+                  onChangeText={(t) => setOtpCode(t.replace(/\D/g, '').slice(0, 6))}
+                  keyboardType="number-pad"
+                  autoFocus
+                  maxLength={6}
+                  textAlign="center"
+                />
+              </View>
+
+              {otpSubmitting || isLoading ? (
+                <ActivityIndicator size="large" color={colors.primary} style={styles.spinner} />
+              ) : (
+                <TouchableOpacity
+                  style={[styles.button, otpCode.length !== 6 && styles.buttonDisabled]}
+                  onPress={handleVerifyOtp}
+                  disabled={otpCode.length !== 6}
+                >
+                  <Text style={styles.buttonText}>Verify & sign in</Text>
+                </TouchableOpacity>
+              )}
+
+              <View style={styles.otpFooterRow}>
+                <TouchableOpacity onPress={cancelOtpStep} style={styles.otpFooterBtn}>
+                  <Text style={styles.otpFooterMuted}>Use another account</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  onPress={handleResendOtp}
+                  disabled={otpResendCooldown > 0 || otpResending}
+                  style={styles.otpFooterBtn}
+                  accessibilityRole="button"
+                >
+                  {otpResending ? (
+                    <ActivityIndicator size="small" color={colors.primary} />
+                  ) : (
+                    <Text
+                      style={[
+                        styles.otpFooterLink,
+                        otpResendCooldown > 0 && styles.otpFooterLinkDisabled,
+                      ]}
+                    >
+                      {otpResendCooldown > 0 ? `Resend in ${otpResendCooldown}s` : 'Resend code'}
+                    </Text>
+                  )}
+                </TouchableOpacity>
+              </View>
+            </View>
+          )}
+
+          {!otpStep && (
+            <View style={styles.footer}>
+              <Text style={styles.footerText}>No account yet? </Text>
+              <TouchableOpacity onPress={() => navigation.navigate('Signup')}>
+                <Text style={styles.linkText}>Create one</Text>
+              </TouchableOpacity>
+            </View>
+          )}
         </ScrollView>
       </KeyboardAvoidingView>
       <ForgotPasswordModal visible={forgotOpen} onClose={() => setForgotOpen(false)} initialEmail="" />
@@ -343,11 +529,79 @@ const getStyles = (colors, isDark) => {
       alignItems: 'center',
       marginTop: 8,
     },
+    buttonDisabled: {
+      opacity: 0.5,
+    },
     buttonText: {
       color: '#fff',
       fontSize: 17,
       fontWeight: '800',
       letterSpacing: 0.3,
+    },
+    buttonContentRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'center',
+      gap: 10,
+    },
+    buttonTextWithSpinner: {
+      marginLeft: 4,
+    },
+    otpHintBox: {
+      flexDirection: 'row',
+      alignItems: 'flex-start',
+      gap: 10,
+      padding: 12,
+      borderRadius: 10,
+      backgroundColor: isDark ? '#1e293b' : '#f1f5f9',
+      borderWidth: 1,
+      borderColor: isDark ? '#334155' : colors.border,
+      marginBottom: 16,
+    },
+    otpHintText: {
+      flex: 1,
+      fontSize: 13,
+      lineHeight: 18,
+      color: colors.textSecondary,
+      fontWeight: '600',
+    },
+    otpHintEmail: {
+      color: colors.text,
+      fontWeight: '800',
+    },
+    otpInput: {
+      backgroundColor: isDark ? colors.inputBackground : '#f8fafc',
+      borderWidth: 1,
+      borderColor: colors.border,
+      paddingVertical: 14,
+      borderRadius: 12,
+      fontSize: 26,
+      fontWeight: '800',
+      letterSpacing: 12,
+      color: colors.text,
+    },
+    otpFooterRow: {
+      flexDirection: 'row',
+      justifyContent: 'space-between',
+      alignItems: 'center',
+      marginTop: 14,
+    },
+    otpFooterBtn: {
+      paddingVertical: 6,
+      paddingHorizontal: 4,
+    },
+    otpFooterMuted: {
+      fontSize: 13,
+      fontWeight: '700',
+      color: colors.textSecondary,
+    },
+    otpFooterLink: {
+      fontSize: 13,
+      fontWeight: '800',
+      color: colors.primary,
+    },
+    otpFooterLinkDisabled: {
+      opacity: 0.5,
     },
     biometricBtn: {
       flexDirection: 'row',

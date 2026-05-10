@@ -1,13 +1,14 @@
 import React, { useContext, useEffect } from 'react';
-import { StatusBar, View, ActivityIndicator, Text, AppState, Platform } from 'react-native';
+import { StatusBar, View, ActivityIndicator, Text, AppState, Platform, StyleSheet } from 'react-native';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { NavigationContainer, DarkTheme as NavigationDarkTheme, DefaultTheme as NavigationDefaultTheme } from '@react-navigation/native';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
-import { SafeAreaProvider } from 'react-native-safe-area-context';
+import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import messaging from '@react-native-firebase/messaging';
 import Icon from 'react-native-vector-icons/MaterialIcons';
 import { CometChatI18nProvider, CometChatThemeProvider } from '@cometchat/chat-uikit-react-native';
+import Config from 'react-native-config';
 
 // Import Screens & Context
 import KeepAwake, { activateKeepAwake } from '@sayem314/react-native-keep-awake';
@@ -20,6 +21,7 @@ import LayoutStack from './src/navigation/LayoutStack';
 import AreaStatementScreen from './src/screens/AreaStatementScreen';
 import SummaryScreen from './src/screens/SummaryScreen';
 import WaitingListScreen from './src/screens/WaitingListScreen';
+import BalanceListScreen from './src/screens/BalanceListScreen';
 import ProfileScreen from './src/screens/ProfileScreen';
 import AdminPanelScreen from './src/screens/AdminPanelScreen';
 import LoginScreen from './src/screens/LoginScreen';
@@ -33,11 +35,30 @@ import { displayLocalNotification } from './src/services/cometchatPushNotificati
 const Tab = createBottomTabNavigator();
 const Stack = createNativeStackNavigator();
 
+// Keep in sync with `tabBarStyle.height` used in FullTabs/GuestTabs below.
+const TAB_BAR_HEIGHT = 74;
+
 function TabLabel({ color, line1, line2 }: { color: string; line1: string; line2: string }) {
   return (
-    <View style={{ alignItems: 'center' }}>
-      <Text style={{ color, fontSize: 10, fontWeight: '600', lineHeight: 13, textAlign: 'center' }}>{line1}</Text>
-      <Text style={{ color, fontSize: 10, fontWeight: '600', lineHeight: 13, textAlign: 'center' }}>{line2}</Text>
+    <View style={{ alignItems: 'center', alignSelf: 'stretch', paddingHorizontal: 0 }}>
+      <Text
+        numberOfLines={1}
+        adjustsFontSizeToFit
+        minimumFontScale={0.7}
+        allowFontScaling={false}
+        style={{ color, fontSize: 10, fontWeight: '600', lineHeight: 12, textAlign: 'center' }}
+      >
+        {line1}
+      </Text>
+      <Text
+        numberOfLines={1}
+        adjustsFontSizeToFit
+        minimumFontScale={0.7}
+        allowFontScaling={false}
+        style={{ color, fontSize: 10, fontWeight: '600', lineHeight: 12, textAlign: 'center' }}
+      >
+        {line2}
+      </Text>
     </View>
   );
 }
@@ -58,6 +79,7 @@ function FullTabs() {
           if (route.name === 'Layout') iconName = 'map';
           else if (route.name === 'Area Statement') iconName = 'pie-chart';
           else if (route.name === 'Waiting List') iconName = 'hourglass-top';
+          else if (route.name === 'Balance List') iconName = 'account-balance-wallet';
           else if (route.name === 'Summary') iconName = 'list-alt';
           else if (route.name === 'Admin') iconName = 'admin-panel-settings';
           else if (route.name === 'Profile') iconName = 'person';
@@ -66,7 +88,7 @@ function FullTabs() {
         tabBarActiveTintColor: colors.primary,
         tabBarInactiveTintColor: colors.textSecondary,
         tabBarHideOnKeyboard: true,
-        tabBarItemStyle: { paddingVertical: 4 },
+        tabBarItemStyle: { paddingVertical: 4, paddingHorizontal: 0 },
         tabBarStyle: {
           paddingBottom: 2,
           paddingTop: 2,
@@ -79,6 +101,7 @@ function FullTabs() {
       <Tab.Screen name="Layout" component={LayoutStack} options={{ title: 'Master Plan', headerShown: false, tabBarLabel: ({ color }) => <TabLabel color={color} line1="Master" line2="Plan" /> }} />
       <Tab.Screen name="Area Statement" component={AreaStatementScreen} options={{ title: 'Area Statement', tabBarLabel: ({ color }) => <TabLabel color={color} line1="Area" line2="Statement" /> }} />
       <Tab.Screen name="Waiting List" component={WaitingListScreen} options={{ title: 'Waiting List', tabBarLabel: ({ color }) => <TabLabel color={color} line1="Waiting" line2="List" /> }} />
+      <Tab.Screen name="Balance List" component={BalanceListScreen} options={{ title: 'Balance List', tabBarLabel: ({ color }) => <TabLabel color={color} line1="Balance" line2="List" /> }} />
       <Tab.Screen name="Summary" component={SummaryScreen} options={{ title: 'Activity Summary', tabBarLabel: ({ color }) => <TabLabel color={color} line1="Activity" line2="Summary" /> }} />
       {canAccessAdmin && (
         <Tab.Screen name="Admin" component={AdminPanelScreen} options={{ title: 'Admin Panel', headerShown: false, tabBarLabel: ({ color }) => <TabLabel color={color} line1="Admin" line2="Panel" /> }} />
@@ -107,7 +130,7 @@ function GuestTabs() {
         tabBarActiveTintColor: colors.primary,
         tabBarInactiveTintColor: colors.textSecondary,
         tabBarHideOnKeyboard: true,
-        tabBarItemStyle: { paddingVertical: 4 },
+        tabBarItemStyle: { paddingVertical: 4, paddingHorizontal: 0 },
         tabBarStyle: {
           paddingBottom: 2,
           paddingTop: 2,
@@ -171,6 +194,9 @@ function NavigationWrapper() {
 
 function AppContent() {
   const { isDark, colors } = useTheme();
+  const insets = useSafeAreaInsets();
+  const showDevBadge = String(Config.DEV_APP || '').trim().toLowerCase() === 'true';
+  const activeApiUrl = String(Config.API_URL || '').trim() || 'API_URL missing';
   return (
     <>
       <StatusBar barStyle={isDark ? 'light-content' : 'dark-content'} backgroundColor={colors.surface} />
@@ -180,6 +206,32 @@ function AppContent() {
           <UserAvatarProvider>
             <CometChatSession />
             <NavigationWrapper />
+            {showDevBadge ? (
+              <>
+                <View
+                  pointerEvents="none"
+                  style={[
+                    styles.devBadge,
+                    { top: Math.max(insets.top, 8) + 6 },
+                  ]}
+                >
+                  <Text style={styles.devBadgeText}>DEV</Text>
+                </View>
+                {/* Temporarily hidden — restore when needed.
+                <View
+                  pointerEvents="none"
+                  style={[
+                    styles.devApiBadge,
+                    { bottom: Math.max(insets.bottom, 8) + TAB_BAR_HEIGHT + 6 },
+                  ]}
+                >
+                  <Text style={styles.devApiBadgeText} numberOfLines={1}>
+                    API: {activeApiUrl}
+                  </Text>
+                </View>
+                */}
+              </>
+            ) : null}
           </UserAvatarProvider>
         </AuthProvider>
       </AlertProvider>
@@ -234,3 +286,45 @@ function App(): React.JSX.Element {
 }
 
 export default App;
+
+const styles = StyleSheet.create({
+  devBadge: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    alignItems: 'center',
+    paddingLeft: 80,
+    backgroundColor: 'transparent',
+    zIndex: 9999,
+    elevation: 10,
+    opacity: 0.5,
+  },
+  devBadgeText: {
+    color: '#fff',
+    fontSize: 11,
+    fontWeight: '800',
+    letterSpacing: 0.6,
+    backgroundColor: '#b91c1c',
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    overflow: 'hidden',
+  },
+  devApiBadge: {
+    position: 'absolute',
+    alignSelf: 'center',
+    maxWidth: '92%',
+    backgroundColor: 'rgba(15, 23, 42, 0.55)',
+    borderRadius: 999,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    zIndex: 9999,
+    elevation: 10,
+    opacity: 0.6,
+  },
+  devApiBadgeText: {
+    color: '#fff',
+    fontSize: 11,
+    fontWeight: '700',
+  },
+});

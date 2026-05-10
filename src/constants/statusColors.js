@@ -31,6 +31,9 @@ export function getStatusSwatchColor(action, newStatus, waiterCount) {
   if (action === 'Reserved BM' || newStatus === 'BM') return STATUS_COLORS.BM;
   if (action === 'Booked' || newStatus === 'booked') return STATUS_COLORS.booked;
   if (action === 'Updated Booking') return STATUS_COLORS.booked;
+  if (action === 'Marked Full Advance Received' || action === 'Unmarked Full Advance Received') {
+    return STATUS_COLORS.booked;
+  }
   if (action === 'Updated Waiter') return STATUS_COLORS.waiting;
   if (action === 'Added to Waiting List' || newStatus === 'waiting') {
     return waiterCount > 1 ? STATUS_COLORS.waitingMultiple : STATUS_COLORS.waiting;

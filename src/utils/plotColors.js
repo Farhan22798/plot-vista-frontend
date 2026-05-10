@@ -24,5 +24,8 @@ export function matchesLayoutStatusFilter(plot, filter) {
     return plot.status === 'waiting' && (plot.waitingList?.length || 0) > 1;
   }
   if (filter === 'BM') return plot.status === 'BM';
+  if (filter === 'full_advance') {
+    return plot.status === 'booked' && Boolean(plot.bookingDetails?.isFullAdvanceReceived);
+  }
   return true;
 }

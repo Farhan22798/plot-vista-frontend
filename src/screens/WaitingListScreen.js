@@ -53,6 +53,22 @@ import Orientation from 'react-native-orientation-locker';
 
 const normalizeDigits = (s) => String(s || '').replace(/\D/g, '');
 
+/** First non-empty digit string from saved mobiles (for stable sort). */
+function primaryMobileDigits(waiter) {
+  for (const m of waiter.customerMobiles || []) {
+    const d = normalizeDigits(m);
+    if (d) return d;
+  }
+  return '';
+}
+
+/** Plot number (numeric) then queue position — stable tie-breaker. */
+function tieBreakPlotQueue(a, b) {
+  const cmp = String(a.plotNumber).localeCompare(String(b.plotNumber), undefined, { numeric: true });
+  if (cmp !== 0) return cmp;
+  return a.queuePosition - b.queuePosition;
+}
+
 function rowMatchesSearch(row, qRaw) {
   const q = qRaw.trim();
   if (!q) return true;
@@ -104,7 +120,7 @@ const TABLE_COL = {
   actions: 112,
 };
 
-const DEFAULT_SORT_BY = 'date';
+const DEFAULT_SORT_BY = 'plot';
 const DEFAULT_SORT_DIR = 'asc';
 
 /** Preset sorts: each option states exactly how rows will be ordered. */
@@ -122,6 +138,34 @@ const SORT_PRESETS = [
     sortDir: 'desc',
     title: 'Plot number (high → low)',
     hint: 'Larger plot numbers first. Same plot: queue order preserved.',
+  },
+  {
+    id: 'name_asc',
+    sortBy: 'name',
+    sortDir: 'asc',
+    title: 'Customer name (A → Z)',
+    hint: 'Alphabetical by customer name. Same name: lower plot number first.',
+  },
+  {
+    id: 'name_desc',
+    sortBy: 'name',
+    sortDir: 'desc',
+    title: 'Customer name (Z → A)',
+    hint: 'Reverse alphabetical. Same name: lower plot number first.',
+  },
+  {
+    id: 'mobile_asc',
+    sortBy: 'mobile',
+    sortDir: 'asc',
+    title: 'Contact number (low → high)',
+    hint: 'By first saved mobile (digits only). Rows with no number sort last.',
+  },
+  {
+    id: 'mobile_desc',
+    sortBy: 'mobile',
+    sortDir: 'desc',
+    title: 'Contact number (high → low)',
+    hint: 'By first saved mobile (digits only). Rows with no number sort last.',
   },
   {
     id: 'date_newest',
@@ -227,15 +271,20 @@ const WaitingListScreen = () => {
   const [editAddress, setEditAddress] = useState('');
   const [editCategory, setEditCategory] = useState('regular');
   const [searchQuery, setSearchQuery] = useState('');
-  const [selectedId, setSelectedId] = useState(null);
+  const [expandedByRowId, setExpandedByRowId] = useState({});
   const [sortBy, setSortBy] = useState(DEFAULT_SORT_BY);
   const [sortDir, setSortDir] = useState(DEFAULT_SORT_DIR);
   const [sortModalVisible, setSortModalVisible] = useState(false);
-  const [pendingPresetId, setPendingPresetId] = useState('plot_asc');
+  const [pendingPresetId, setPendingPresetId] = useState(() => presetIdFromSort(DEFAULT_SORT_BY, DEFAULT_SORT_DIR));
   const [sharing, setSharing] = useState(false);
 
-  const toggleSelect = useCallback((id) => {
-    setSelectedId((prev) => (prev === id ? null : id));
+  const toggleRowExpanded = useCallback((id) => {
+    setExpandedByRowId((prev) => {
+      const next = { ...prev };
+      if (next[id]) delete next[id];
+      else next[id] = true;
+      return next;
+    });
   }, []);
 
   const openSortModal = useCallback(() => {
@@ -255,7 +304,7 @@ const WaitingListScreen = () => {
   const clearSortFilter = useCallback(() => {
     setSortBy(DEFAULT_SORT_BY);
     setSortDir(DEFAULT_SORT_DIR);
-    setPendingPresetId('plot_asc');
+    setPendingPresetId(presetIdFromSort(DEFAULT_SORT_BY, DEFAULT_SORT_DIR));
     setSortModalVisible(false);
   }, []);
 
@@ -281,17 +330,38 @@ const WaitingListScreen = () => {
         if (cmp !== 0) return cmp * dir;
         return a.queuePosition - b.queuePosition;
       }
+      if (sortBy === 'name') {
+        const na = (a.waiter.customerName || '').trim();
+        const nb = (b.waiter.customerName || '').trim();
+        const cmp = na.localeCompare(nb, undefined, { sensitivity: 'base' });
+        if (cmp !== 0) return cmp * dir;
+        return tieBreakPlotQueue(a, b);
+      }
+      if (sortBy === 'mobile') {
+        const ma = primaryMobileDigits(a.waiter);
+        const mb = primaryMobileDigits(b.waiter);
+        const aEmpty = !ma;
+        const bEmpty = !mb;
+        if (aEmpty !== bEmpty) return aEmpty ? 1 : -1;
+        const cmp = ma.localeCompare(mb, undefined, { numeric: true });
+        if (cmp !== 0) return cmp * dir;
+        return tieBreakPlotQueue(a, b);
+      }
       if (sortBy === 'date') {
         const da = new Date(a.waiter.createdAt || 0).getTime();
         const db = new Date(b.waiter.createdAt || 0).getTime();
-        return (da - db) * dir;
+        const cmp = da - db;
+        if (cmp !== 0) return cmp * dir;
+        return tieBreakPlotQueue(a, b);
       }
       if (sortBy === 'owner') {
         const aa = (a.waiter.createdBy || '').toLowerCase();
         const ab = (b.waiter.createdBy || '').toLowerCase();
-        return aa.localeCompare(ab) * dir;
+        const cmp = aa.localeCompare(ab);
+        if (cmp !== 0) return cmp * dir;
+        return tieBreakPlotQueue(a, b);
       }
-      return 0;
+      return tieBreakPlotQueue(a, b);
     });
     return rows;
   }, [plots, sortBy, sortDir]);
@@ -365,9 +435,9 @@ const WaitingListScreen = () => {
       'Plot No': item.plotNumber,
       Waiting: toOrdinal(item.queuePosition),
       Name: item.waiter.customerName || '-',
-      Contact: (item.waiter.customerMobiles || []).filter((m) => String(m).trim()).join(', ') || '-',
       Type: labelForCustomerCategory(item.waiter.customerCategory),
       Address: (item.waiter.customerAddress || '').trim() || '-',
+      Contact: (item.waiter.customerMobiles || []).filter((m) => String(m).trim()).join(', ') || '-',
       Remarks: formatRemarkLogForExport(item.waiter),
       Added: item.waiter.createdAt ? formatDateTimeUtil(item.waiter.createdAt) : '-',
       By: nameOnly(item.waiter.createdBy),
@@ -393,9 +463,9 @@ const WaitingListScreen = () => {
       'Plot No',
       'Waiting',
       'Name',
-      'Contact',
       'Customer type',
       'Address',
+      'Contact',
       'Remarks',
       'Added',
       'By',
@@ -408,9 +478,9 @@ const WaitingListScreen = () => {
       { header: 'Plot No', key: 'Plot No', width: 10 },
       { header: 'Waiting', key: 'Waiting', width: 13 },
       { header: 'Name', key: 'Name', width: 25 },
-      { header: 'Contact', key: 'Contact', width: 25 },
       { header: 'Customer type', key: 'Type', width: 14 },
       { header: 'Address', key: 'Address', width: 30 },
+      { header: 'Contact', key: 'Contact', width: 25 },
       { header: 'Remarks', key: 'Remarks', width: 32 },
       { header: 'Added', key: 'Added', width: 24 },
       { header: 'By', key: 'By', width: 20 },
@@ -482,9 +552,9 @@ const WaitingListScreen = () => {
       { key: 'Plot No', label: 'Plot', width: 42 },
       { key: 'Waiting', label: 'Waiting', width: 56 },
       { key: 'Name', label: 'Name', width: 108 },
-      { key: 'Contact', label: 'Contact', width: 108 },
       { key: 'Type', label: 'Type', width: 52 },
       { key: 'Address', label: 'Address', width: 124 },
+      { key: 'Contact', label: 'Contact', width: 108 },
       { key: 'Remarks', label: 'Remarks', width: 138 },
       { key: 'By', label: 'By', width: 78 },
       { key: 'Added', label: 'Added', width: 84 },
@@ -852,46 +922,40 @@ const WaitingListScreen = () => {
   const isDefaultSort = sortBy === DEFAULT_SORT_BY && sortDir === DEFAULT_SORT_DIR;
 
   const renderTableHeader = () => (
-    <View
-      style={[
-        styles.tableRow,
-        styles.tableHeaderRow,
-        { borderColor: colors.border, width: tableWidth },
-      ]}
-    >
-      <Text style={[styles.tableCell, styles.tableHeaderText, styles.tableCellCenter, { width: TABLE_COL.sr }]}>
-        {'Sr.\nNo.'}
-      </Text>
-      <Text style={[styles.tableCell, styles.tableHeaderText, styles.tableCellCenter, { width: TABLE_COL.plot }]}>
-        {'Plot\nNo.'}
-      </Text>
-      <Text style={[styles.tableCell, styles.tableHeaderText, styles.tableCellCenter, { width: TABLE_COL.wait }]}>
-        Waiting
-      </Text>
-      <Text style={[styles.tableCell, styles.tableHeaderText, styles.tableCellCenter, { width: TABLE_COL.name }]}>
-        Name
-      </Text>
-      <Text style={[styles.tableCell, styles.tableHeaderText, styles.tableCellCenter, { width: TABLE_COL.mobile }]}>
-        Contact
-      </Text>
-      <Text style={[styles.tableCell, styles.tableHeaderText, styles.tableCellCenter, { width: TABLE_COL.type }]}>
-        Type
-      </Text>
-      <Text style={[styles.tableCell, styles.tableHeaderText, styles.tableCellCenter, { width: TABLE_COL.address }]}>
-        Address
-      </Text>
-      <Text style={[styles.tableCell, styles.tableHeaderText, styles.tableCellCenter, { width: TABLE_COL.remarks }]}>
-        Remarks
-      </Text>
-      <Text style={[styles.tableCell, styles.tableHeaderText, styles.tableCellCenter, { width: TABLE_COL.added }]}>
-        Added
-      </Text>
-      <Text style={[styles.tableCell, styles.tableHeaderText, styles.tableCellCenter, { width: TABLE_COL.by }]}>
-        By
-      </Text>
-      <Text style={[styles.tableCell, styles.tableHeaderText, styles.tableCellCenter, { width: TABLE_COL.actions }]}>
-        Actions
-      </Text>
+    <View style={[styles.headerRow, { width: tableWidth }]}>
+      <View style={[styles.headerGridCell, { width: TABLE_COL.sr }]}>
+        <Text style={styles.headerCell}>{'Sr.\nNo.'}</Text>
+      </View>
+      <View style={[styles.headerGridCell, { width: TABLE_COL.plot }]}>
+        <Text style={styles.headerCell}>{'Plot\nNo.'}</Text>
+      </View>
+      <View style={[styles.headerGridCell, { width: TABLE_COL.wait }]}>
+        <Text style={styles.headerCell}>Waiting</Text>
+      </View>
+      <View style={[styles.headerGridCell, { width: TABLE_COL.name }]}>
+        <Text style={styles.headerCell}>Name</Text>
+      </View>
+      <View style={[styles.headerGridCell, { width: TABLE_COL.type }]}>
+        <Text style={styles.headerCell}>Type</Text>
+      </View>
+      <View style={[styles.headerGridCell, { width: TABLE_COL.address }]}>
+        <Text style={styles.headerCell}>Address</Text>
+      </View>
+      <View style={[styles.headerGridCell, { width: TABLE_COL.mobile }]}>
+        <Text style={styles.headerCell}>Contact</Text>
+      </View>
+      <View style={[styles.headerGridCell, { width: TABLE_COL.remarks }]}>
+        <Text style={styles.headerCell}>Remarks</Text>
+      </View>
+      <View style={[styles.headerGridCell, { width: TABLE_COL.added }]}>
+        <Text style={styles.headerCell}>Added</Text>
+      </View>
+      <View style={[styles.headerGridCell, { width: TABLE_COL.by }]}>
+        <Text style={styles.headerCell}>By</Text>
+      </View>
+      <View style={[styles.headerGridCell, styles.gridCellLast, { width: TABLE_COL.actions }]}>
+        <Text style={styles.headerCell}>Actions</Text>
+      </View>
     </View>
   );
 
@@ -903,36 +967,61 @@ const WaitingListScreen = () => {
     const added = item.waiter.createdAt ? formatDateTime(item.waiter.createdAt) : '-';
     const by = nameOnly(item.waiter.createdBy);
     const rowId = `${item.plotId}:${item.waiter._id}`;
-    const isSelected = selectedId === rowId;
+    const isExpanded = !!expandedByRowId[rowId];
+    const isEven = (item.globalSr - 1) % 2 === 0;
+    const nl = isExpanded ? undefined : 1;
     return (
       <Pressable
-        onPress={() => toggleSelect(rowId)}
+        onPress={() => toggleRowExpanded(rowId)}
         style={[
-          styles.tableRow,
-          styles.tableDataRow,
-          { borderColor: colors.border, width: tableWidth },
-          isSelected && styles.rowSelected,
+          styles.dataRow,
+          { width: tableWidth },
+          isEven ? styles.rowEven : styles.rowOdd,
+          isExpanded && styles.rowExpanded,
+          !isExpanded && styles.dataRowCollapsed,
         ]}
       >
-        <Text style={[styles.tableCell, styles.tableText, styles.tableCellCenter, { width: TABLE_COL.sr }]}>
-          {item.globalSr}
-        </Text>
-        <Text style={[styles.tableCell, styles.tableText, styles.tableCellCenter, { width: TABLE_COL.plot }]}>
-          {item.plotNumber}
-        </Text>
-        <Text style={[styles.tableCell, styles.tableText, styles.tableCellCenter, { width: TABLE_COL.wait }]}>
-          {toOrdinal(item.queuePosition)}
-        </Text>
-        <View style={[styles.tableCell, styles.tableCellCenteredCol, { width: TABLE_COL.name }]}>
-          <Text style={[styles.tableText, styles.tableTextCenter]}>{item.waiter.customerName || '-'}</Text>
+        <View style={[styles.gridCell, { width: TABLE_COL.sr }]}>
+          <Text style={[styles.tableText, styles.tableTextCenter]}>{item.globalSr}</Text>
         </View>
-        <View style={[styles.tableCell, styles.tableCellCenteredCol, { width: TABLE_COL.mobile }]}>
+        <View style={[styles.gridCell, { width: TABLE_COL.plot }]}>
+          <Text style={[styles.tableText, styles.tableTextCenter]}>{item.plotNumber}</Text>
+        </View>
+        <View style={[styles.gridCell, { width: TABLE_COL.wait }]}>
+          <Text style={[styles.tableText, styles.tableTextCenter]}>{toOrdinal(item.queuePosition)}</Text>
+        </View>
+        <View style={[styles.gridCell, styles.tableCellCenteredCol, { width: TABLE_COL.name }]}>
+          <Text style={[styles.tableText, styles.tableTextCenter]} numberOfLines={nl} ellipsizeMode="tail">
+            {item.waiter.customerName || '-'}
+          </Text>
+        </View>
+        <View style={[styles.gridCell, styles.tableCellCenteredCol, { width: TABLE_COL.type }]}>
+          <Text style={[styles.tableTextSmall, styles.tableTextCenter]} numberOfLines={2}>
+            {typeLabel}
+          </Text>
+        </View>
+        <View style={[styles.gridCell, styles.tableCellCenteredCol, { width: TABLE_COL.address }]}>
+          <Text
+            style={[addr ? styles.tableText : styles.tableTextMuted, styles.tableTextCenter]}
+            numberOfLines={nl}
+            ellipsizeMode="tail"
+          >
+            {addr || '—'}
+          </Text>
+        </View>
+        <View style={[styles.gridCell, styles.tableCellCenteredCol, { width: TABLE_COL.mobile }]}>
           {mobiles.length === 0 ? (
             <Text style={[styles.tableTextMuted, styles.tableTextCenter]}>-</Text>
           ) : (
             mobiles.map((m, mi) => (
               <View key={mi} style={styles.mobileLine}>
-                <Text style={[styles.tableText, styles.mobileLineText, styles.tableTextCenter]}>{m}</Text>
+                <Text
+                  style={[styles.tableText, styles.mobileLineText, styles.tableTextCenter]}
+                  numberOfLines={nl}
+                  ellipsizeMode="tail"
+                >
+                  {m}
+                </Text>
                 <TouchableOpacity
                   onPress={() => dialPhone(m)}
                   style={styles.tableCallMini}
@@ -944,20 +1033,14 @@ const WaitingListScreen = () => {
             ))
           )}
         </View>
-        <View style={[styles.tableCell, styles.tableCellCenteredCol, { width: TABLE_COL.type }]}>
-          <Text style={[styles.tableTextSmall, styles.tableTextCenter]} numberOfLines={2}>
-            {typeLabel}
-          </Text>
-        </View>
-        <View style={[styles.tableCell, styles.tableCellCenteredCol, { width: TABLE_COL.address }]}>
-          <Text style={[addr ? styles.tableText : styles.tableTextMuted, styles.tableTextCenter]}>
-            {addr || '—'}
-          </Text>
-        </View>
-        <View style={[styles.tableCell, styles.remarksCellWithAdd, { width: TABLE_COL.remarks }]}>
+        <View style={[styles.gridCell, styles.remarksCellWithAdd, { width: TABLE_COL.remarks }]}>
           <View style={styles.remarksCellTextCol}>
             {remarkEntries.length === 0 ? (
               <Text style={[styles.tableTextMuted, styles.tableTextCenter]}>—</Text>
+            ) : !isExpanded ? (
+              <Text style={[styles.tableText, styles.tableTextCenter]} numberOfLines={1} ellipsizeMode="tail">
+                {remarkEntries[0]?.text || '—'}
+              </Text>
             ) : (
               remarkEntries.map((e, ei) => (
                 <View key={e._id != null ? String(e._id) : `e-${ei}`} style={styles.remarksTableBlock}>
@@ -974,52 +1057,62 @@ const WaitingListScreen = () => {
               ))
             )}
           </View>
-          <RemarkLogSection
-            listDisplay="addButtonOnly"
-            entries={remarkEntries}
-            readOnly={false}
-            disabled={false}
-            onAdd={async (text) => {
-              const res = await api.post(
-                `/${idForApiPath(item.plotId)}/waiting/${idForApiPath(item.waiter._id)}/remarks`,
-                { text },
-              );
-              mergePlotFromRemarkResponse(res.data);
-              notifyWaitingNoteToCometchat({
-                isUpdate: false,
-                plotNumber: item.plotNumber,
-                customerName: item.waiter.customerName,
-                preview: text,
-              });
-            }}
-            onPatch={async (rid, text) => {
-              const res = await api.patch(
-                `/${idForApiPath(item.plotId)}/waiting/${idForApiPath(item.waiter._id)}/remarks/${rid}`,
-                { text },
-              );
-              mergePlotFromRemarkResponse(res.data);
-              notifyWaitingNoteToCometchat({
-                isUpdate: true,
-                plotNumber: item.plotNumber,
-                customerName: item.waiter.customerName,
-                preview: text,
-              });
-            }}
-          />
+          {isExpanded ? (
+            <RemarkLogSection
+              listDisplay="addButtonOnly"
+              entries={remarkEntries}
+              readOnly={false}
+              disabled={false}
+              onAdd={async (text) => {
+                const res = await api.post(
+                  `/${idForApiPath(item.plotId)}/waiting/${idForApiPath(item.waiter._id)}/remarks`,
+                  { text },
+                );
+                mergePlotFromRemarkResponse(res.data);
+                notifyWaitingNoteToCometchat({
+                  isUpdate: false,
+                  plotNumber: item.plotNumber,
+                  customerName: item.waiter.customerName,
+                  preview: text,
+                });
+              }}
+              onPatch={async (rid, text) => {
+                const res = await api.patch(
+                  `/${idForApiPath(item.plotId)}/waiting/${idForApiPath(item.waiter._id)}/remarks/${rid}`,
+                  { text },
+                );
+                mergePlotFromRemarkResponse(res.data);
+                notifyWaitingNoteToCometchat({
+                  isUpdate: true,
+                  plotNumber: item.plotNumber,
+                  customerName: item.waiter.customerName,
+                  preview: text,
+                });
+              }}
+            />
+          ) : null}
         </View>
-        <View style={[styles.tableCell, styles.tableCellCenteredCol, { width: TABLE_COL.added }]}>
-          <Text style={[styles.tableTextSmall, styles.tableTextCenter]}>{added}</Text>
+        <View style={[styles.gridCell, styles.tableCellCenteredCol, { width: TABLE_COL.added }]}>
+          <Text style={[styles.tableTextSmall, styles.tableTextCenter]} numberOfLines={nl}>
+            {added}
+          </Text>
         </View>
-        <View style={[styles.tableCell, styles.byCell, { width: TABLE_COL.by }]}>
+        <View style={[styles.gridCell, styles.byCell, { width: TABLE_COL.by }]}>
           <UserAvatar
             name={item.waiter.createdBy}
             imageUrl={item.waiter.createdByAvatarUrl}
             size={24}
             style={styles.byAvatar}
           />
-          <Text style={[styles.tableTextSmall, styles.byName, styles.tableTextCenter]}>{by}</Text>
+          <Text
+            style={[styles.tableTextSmall, styles.byName, styles.tableTextCenter]}
+            numberOfLines={nl}
+            ellipsizeMode="tail"
+          >
+            {by}
+          </Text>
         </View>
-        <View style={[styles.tableCell, styles.actionRow, { width: TABLE_COL.actions }]}>
+        <View style={[styles.gridCell, styles.gridCellLast, styles.actionRow, { width: TABLE_COL.actions }]}>
           <TouchableOpacity
             style={styles.tableIconBtn}
             onPress={() => openEdit(item)}
@@ -1154,15 +1247,15 @@ const WaitingListScreen = () => {
           >
             <View
               style={[
-                styles.tableInner,
-                styles.tableInnerLandscape,
+                styles.tableWrapper,
+                styles.tableWrapperLandscape,
                 { width: tableWidth, minHeight: landscapeTableMinHeight },
               ]}
             >
               <SectionList
                 sections={displaySections}
                 keyExtractor={(item) => `${item.plotId}:${item.waiter._id}`}
-                extraData={selectedId}
+                extraData={expandedByRowId}
                 renderItem={({ item }) => renderTableRow({ item })}
                 renderSectionHeader={() => renderTableHeader()}
                 stickySectionHeadersEnabled
@@ -1193,11 +1286,11 @@ const WaitingListScreen = () => {
           style={styles.horizontalTableHost}
           contentContainerStyle={styles.horizontalTableContent}
         >
-          <View style={[styles.tableInner, { width: tableWidth }]}>
+          <View style={[styles.tableWrapper, { width: tableWidth }]}>
             <SectionList
               sections={displaySections}
               keyExtractor={(item) => `${item.plotId}:${item.waiter._id}`}
-              extraData={selectedId}
+              extraData={expandedByRowId}
               renderItem={({ item }) => renderTableRow({ item })}
               renderSectionHeader={({ section }) => {
                 if (!section.customerName || !searchQuery.trim()) {
@@ -1219,7 +1312,7 @@ const WaitingListScreen = () => {
                   </View>
                 );
               }}
-              stickySectionHeadersEnabled={false}
+              stickySectionHeadersEnabled
               style={{ flex: 1, width: tableWidth }}
               contentContainerStyle={styles.listContent}
               onRefresh={() => {
@@ -1603,7 +1696,7 @@ const getStyles = (colors, isDark) =>
     },
     sortModalTitle: { fontSize: 18, fontWeight: '800', marginBottom: 6 },
     sortModalSubtitle: { fontSize: 13, lineHeight: 19, marginBottom: 14 },
-    sortModalScroll: { maxHeight: 340 },
+    sortModalScroll: { maxHeight: 400 },
     sortOptionRow: {
       flexDirection: 'row',
       alignItems: 'flex-start',
@@ -1679,47 +1772,66 @@ const getStyles = (colors, isDark) =>
     horizontalTableHost: { flex: 1, marginHorizontal: 14 },
     horizontalTableHostLandscape: { flex: 1, marginHorizontal: 0 },
     horizontalTableContent: { flexGrow: 1 },
-    tableInner: { flex: 1, minHeight: 200 },
-    tableInnerLandscape: { flex: 1 },
-    tableRow: {
+    tableWrapper: {
+      flex: 1,
+      minHeight: 200,
+    },
+    tableWrapperLandscape: {
+      flex: 1,
+    },
+
+    headerRow: {
       flexDirection: 'row',
-      alignItems: 'center',
-      borderWidth: 1,
-      borderTopWidth: 0,
-      backgroundColor: colors.surface,
-    },
-    tableHeaderRow: {
-      borderTopWidth: 2,
-      borderBottomWidth: 2,
+      alignItems: 'stretch',
       backgroundColor: isDark ? '#312e81' : '#1e3a8a',
-      borderColor: isDark ? '#6366f1' : '#3b82f6',
-      borderTopLeftRadius: 10,
-      borderTopRightRadius: 10,
+      minHeight: 76,
+      borderBottomWidth: 2,
+      borderBottomColor: isDark ? '#6366f1' : '#3b82f6',
     },
-    tableDataRow: {
-      minHeight: 52,
-    },
-    rowSelected: {
-      backgroundColor: isDark ? '#172554' : '#eff6ff',
-      borderWidth: 2.5,
-      borderColor: '#3b82f6',
-      borderRadius: 4,
-      ...Platform.select({
-        android: { elevation: 6 },
-        ios: {
-          shadowColor: '#3b82f6',
-          shadowOffset: { width: 0, height: 0 },
-          shadowOpacity: 0.45,
-          shadowRadius: 8,
-        },
-      }),
-    },
-    tableCell: {
-      paddingVertical: 7,
-      paddingHorizontal: 5,
+    headerGridCell: {
       justifyContent: 'center',
+      alignItems: 'center',
+      borderRightWidth: 1,
+      borderRightColor: isDark ? '#4f46e5' : '#2563eb',
+      paddingVertical: 6,
+      paddingHorizontal: 2,
+    },
+    headerCell: {
+      fontSize: 12,
+      fontWeight: '800',
+      color: '#f8fafc',
+      textAlign: 'center',
+      textTransform: 'uppercase',
+      letterSpacing: 0.5,
+    },
+
+    dataRow: {
+      flexDirection: 'row',
+      alignItems: 'stretch',
+      borderBottomWidth: 1,
+      borderBottomColor: isDark ? '#334155' : '#e2e8f0',
+    },
+    dataRowCollapsed: {
+      height: 60,
+      maxHeight: 60,
+      overflow: 'hidden',
+    },
+    rowExpanded: {
+      minHeight: 64,
+      backgroundColor: isDark ? 'rgba(59, 130, 246, 0.12)' : 'rgba(59, 130, 246, 0.08)',
+    },
+    rowEven: { backgroundColor: isDark ? '#0f172a' : '#f8fafc' },
+    rowOdd: { backgroundColor: isDark ? '#1e293b' : '#ffffff' },
+    gridCell: {
+      justifyContent: 'center',
+      alignItems: 'center',
       borderRightWidth: 1,
       borderRightColor: isDark ? '#334155' : '#e2e8f0',
+      paddingVertical: 8,
+      paddingHorizontal: 4,
+    },
+    gridCellLast: {
+      borderRightWidth: 0,
     },
     tableCellCenteredCol: {
       alignItems: 'center',
@@ -1736,13 +1848,6 @@ const getStyles = (colors, isDark) =>
     },
     byName: {
       width: '100%',
-    },
-    tableHeaderText: {
-      color: '#f8fafc',
-      fontSize: 14,
-      fontWeight: '800',
-      textTransform: 'uppercase',
-      letterSpacing: 0.5,
     },
     tableCellCenter: { textAlign: 'center', alignItems: 'center' },
     tableTextCenter: { textAlign: 'center', alignSelf: 'stretch' },

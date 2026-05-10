@@ -4,15 +4,19 @@
   "private": true,
   "scripts": {
     "android": "react-native run-android",
-    "android:release": "cd android && .\\gradlew.bat assembleRelease",
+    "android:dev": "react-native run-android --mode devDebug --appId com.frontend.dev",
+    "android:prod": "react-native run-android --mode prodDebug --appId com.frontend",
+    "android:release": "cd android && .\\gradlew.bat assembleProdRelease",
+    "android:release:dev": "cd android && .\\gradlew.bat assembleDevRelease",
+    "android:release:prod": "cd android && .\\gradlew.bat assembleProdRelease",
     "ios": "react-native run-ios",
     "lint": "eslint .",
     "start": "react-native start",
     "test": "jest"
   },
   "dependencies": {
-    "@cometchat/chat-sdk-react-native": "^4.0.21",
-    "@cometchat/chat-uikit-react-native": "^5.3.2",
+    "@cometchat/chat-sdk-react-native": "4.0.20",
+    "@cometchat/chat-uikit-react-native": "5.3.2",
     "@notifee/react-native": "^9.1.8",
     "@openspacelabs/react-native-zoomable-view": "^2.4.2",
     "@react-native-async-storage/async-storage": "^3.0.2",

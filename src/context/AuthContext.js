@@ -2,6 +2,10 @@ import React, { createContext, useState, useEffect, useCallback } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { authApi } from '../services/api';
 import { COMETCHAT_UID_STORAGE_KEY } from '../constants/storageKeys';
+import {
+  getDeviceTrustToken,
+  saveDeviceTrustToken,
+} from '../services/deviceTrust';
 
 export const AuthContext = createContext();
 const TEMP_GUEST_MODE_KEY = 'temporaryGuestModeEnabled';
@@ -12,22 +16,86 @@ export const AuthProvider = ({ children }) => {
   const [userInfo, setUserInfo] = useState(null);
   const [temporaryGuestModeEnabled, setTemporaryGuestModeEnabled] = useState(false);
 
+  /**
+   * First-step login.
+   *
+   * Attaches the per-mobile `deviceTrustToken` (if we previously cleared OTP on
+   * this device) so the backend can short-circuit OTP for trusted devices.
+   *
+   * Returns one of:
+   *   - { otpRequired: false }                    → fully logged in, token saved.
+   *   - { otpRequired: true, loginChallengeId,    → caller must show OTP step
+   *       emailHint, expiresInSec, mobileNumber,    and call `verifyLoginOtp`.
+   *       password }
+   *
+   * `password` is returned in the OTP-required result purely so the caller can
+   * pass it into post-login plumbing (e.g. saving biometric credentials only
+   * AFTER the OTP step succeeds). It never leaves the app.
+   */
   const login = async (mobileNumber, password) => {
-    setIsLoading(true);
+    // NOTE: do NOT toggle the global `isLoading` flag here. It is only meant
+    // for the initial app-boot AsyncStorage check (NavigationWrapper unmounts
+    // the entire NavigationContainer when it's true). Flipping it mid-action
+    // would unmount LoginScreen during the request — losing any state set
+    // afterwards (e.g. setOtpStep in the OTP-required path). Per-action
+    // loading is handled by the screen's own button state.
     try {
-      const response = await authApi.post('/login', { mobileNumber, password });
-      const { token, ...userData } = response.data;
+      const deviceTrustToken = await getDeviceTrustToken(mobileNumber);
+      const response = await authApi.post('/login', {
+        mobileNumber,
+        password,
+        ...(deviceTrustToken ? { deviceTrustToken } : {}),
+      });
 
+      if (response.data?.otpRequired) {
+        return {
+          otpRequired: true,
+          loginChallengeId: response.data.loginChallengeId,
+          emailHint: response.data.emailHint || '',
+          expiresInSec: Number(response.data.expiresInSec) || 600,
+          mobileNumber,
+          password,
+        };
+      }
+
+      const { token, deviceTrustToken: newTrustToken, ...userData } = response.data;
       await AsyncStorage.setItem('userInfo', JSON.stringify(userData));
       await AsyncStorage.setItem('userToken', token);
       setUserInfo(userData);
       setUserToken(token);
+      if (newTrustToken) await saveDeviceTrustToken(mobileNumber, newTrustToken);
+      return { otpRequired: false };
     } catch (e) {
       if (__DEV__) console.error(`Login error: ${e.response?.data?.message || e.message}`);
       throw e;
-    } finally {
-      setIsLoading(false);
     }
+  };
+
+  /** Second-step: complete login by verifying the email OTP. */
+  const verifyLoginOtp = async (loginChallengeId, emailOtp, mobileNumber) => {
+    // Same reason as `login` above — don't flip the global isLoading flag
+    // here, or NavigationWrapper will unmount the OTP screen mid-request.
+    try {
+      const response = await authApi.post('/login/verify-otp', {
+        loginChallengeId,
+        emailOtp,
+      });
+      const { token, deviceTrustToken: newTrustToken, ...userData } = response.data;
+      await AsyncStorage.setItem('userInfo', JSON.stringify(userData));
+      await AsyncStorage.setItem('userToken', token);
+      setUserInfo(userData);
+      setUserToken(token);
+      if (newTrustToken) await saveDeviceTrustToken(mobileNumber, newTrustToken);
+    } catch (e) {
+      if (__DEV__) console.error(`OTP verify error: ${e.response?.data?.message || e.message}`);
+      throw e;
+    }
+  };
+
+  /** Resend the OTP for an existing login challenge. */
+  const resendLoginOtp = async (loginChallengeId) => {
+    const response = await authApi.post('/login/resend-otp', { loginChallengeId });
+    return response.data;
   };
 
   const sendSignupOtp = async (email) => {
@@ -165,6 +233,8 @@ export const AuthProvider = ({ children }) => {
     <AuthContext.Provider
       value={{
         login,
+        verifyLoginOtp,
+        resendLoginOtp,
         logout,
         register,
         sendSignupOtp,

@@ -106,16 +106,19 @@ export default function RemarkLogSection({
     }
     try {
       setSaving(true);
+      let keepOpen = false;
       if (editingEntry) {
         const rid =
           editingEntry.isLegacy || !editingEntry._id
             ? 'legacy'
             : String(editingEntry._id);
-        await onPatch(rid, t);
+        const patchResult = await onPatch(rid, t);
+        if (patchResult === false) keepOpen = true;
       } else {
-        await onAdd(t);
+        const addResult = await onAdd(t);
+        if (addResult === false) keepOpen = true;
       }
-      closeModal();
+      if (!keepOpen) closeModal();
     } catch (e) {
       showAlert('Error', formatRemarkSaveError(e));
     } finally {

@@ -18,8 +18,8 @@ export const useAlert = () => useContext(AlertContext);
 
 export const AlertProvider = ({ children }) => {
   const { colors, isDark } = useTheme();
-  const { width } = useWindowDimensions();
-  const styles = useMemo(() => getStyles(colors, isDark, width), [colors, isDark, width]);
+  const { width, height } = useWindowDimensions();
+  const styles = useMemo(() => getStyles(colors, isDark, width, height), [colors, isDark, width, height]);
 
   const [alertState, setAlertState] = useState({
     visible: false,
@@ -27,6 +27,8 @@ export const AlertProvider = ({ children }) => {
     message: '',
     buttons: [],
     verticalButtons: false,
+    /** Wider card + left-aligned body (e.g. multi-line pricing breakdowns). */
+    detailedMessage: false,
   });
 
   const scaleValue = useRef(new Animated.Value(0)).current;
@@ -77,6 +79,7 @@ export const AlertProvider = ({ children }) => {
       message,
       buttons: list,
       verticalButtons,
+      detailedMessage: options.detailedMessage === true,
     });
   }, [hideAlert]);
 
@@ -100,6 +103,7 @@ export const AlertProvider = ({ children }) => {
           <Animated.View
             style={[
               styles.alertBox,
+              alertState.detailedMessage && styles.alertBoxDetailed,
               {
                 opacity: opacityValue,
                 transform: [{ scale: scaleValue }],
@@ -108,16 +112,35 @@ export const AlertProvider = ({ children }) => {
           >
             <View style={styles.content}>
               {alertState.title ? (
-                <Text style={styles.title}>{alertState.title}</Text>
+                <Text style={[styles.title, alertState.detailedMessage && styles.titleDetailed]}>
+                  {alertState.title}
+                </Text>
               ) : null}
               {alertState.message ? (
                 <ScrollView
-                  style={styles.messageScroll}
-                  contentContainerStyle={styles.messageScrollContent}
-                  showsVerticalScrollIndicator={alertState.message.length > 180}
+                  style={[
+                    styles.messageScroll,
+                    alertState.detailedMessage && styles.messageScrollDetailed,
+                  ]}
+                  contentContainerStyle={[
+                    styles.messageScrollContent,
+                    alertState.detailedMessage && styles.messageScrollContentDetailed,
+                  ]}
+                  showsVerticalScrollIndicator
+                  {...(Platform.OS === 'android' ? { persistentScrollbar: true } : {})}
                   keyboardShouldPersistTaps="handled"
+                  nestedScrollEnabled
+                  bounces={!alertState.detailedMessage}
+                  alwaysBounceVertical={false}
                 >
-                  <Text style={styles.message}>{alertState.message}</Text>
+                  <Text
+                    style={[
+                      styles.message,
+                      alertState.detailedMessage && styles.messageDetailed,
+                    ]}
+                  >
+                    {alertState.message}
+                  </Text>
                 </ScrollView>
               ) : null}
             </View>
@@ -170,18 +193,21 @@ export const AlertProvider = ({ children }) => {
   );
 };
 
-const getStyles = (colors, isDark, windowWidth) =>
-  StyleSheet.create({
+const getStyles = (colors, isDark, windowWidth, windowHeight) => {
+  const msgMaxDefault = Math.min(Math.max(160, windowHeight * 0.42), 380);
+  /** Large enough that typical multi-plot advance breakdown fits without scrolling. */
+  const msgMaxDetailed = Math.min(windowHeight * 0.78, 720);
+  return StyleSheet.create({
     overlay: {
       flex: 1,
       backgroundColor: 'rgba(15, 23, 42, 0.72)',
       justifyContent: 'center',
       alignItems: 'center',
-      paddingHorizontal: 20,
+      paddingHorizontal: 16,
     },
     alertBox: {
       width: '100%',
-      maxWidth: Math.min(400, windowWidth - 40),
+      maxWidth: Math.min(400, windowWidth - 32),
       backgroundColor: colors.surface,
       borderRadius: 20,
       padding: 22,
@@ -199,6 +225,11 @@ const getStyles = (colors, isDark, windowWidth) =>
         },
       }),
     },
+    alertBoxDetailed: {
+      maxWidth: Math.min(440, windowWidth - 24),
+      paddingVertical: 20,
+      paddingHorizontal: 18,
+    },
     content: {
       marginBottom: 20,
       alignItems: 'stretch',
@@ -212,12 +243,24 @@ const getStyles = (colors, isDark, windowWidth) =>
       textAlign: 'center',
       letterSpacing: 0.2,
     },
+    titleDetailed: {
+      fontSize: 17,
+      fontWeight: '800',
+      marginBottom: 12,
+      color: isDark ? '#f1f5f9' : '#0f172a',
+    },
     messageScroll: {
-      maxHeight: 140,
+      maxHeight: msgMaxDefault,
       width: '100%',
+    },
+    messageScrollDetailed: {
+      maxHeight: msgMaxDetailed,
     },
     messageScrollContent: {
       flexGrow: 1,
+    },
+    messageScrollContentDetailed: {
+      paddingBottom: 4,
     },
     message: {
       fontSize: 14,
@@ -225,6 +268,13 @@ const getStyles = (colors, isDark, windowWidth) =>
       textAlign: 'center',
       lineHeight: 20,
       fontWeight: '500',
+    },
+    messageDetailed: {
+      fontSize: 15,
+      lineHeight: 23,
+      fontWeight: '600',
+      textAlign: 'left',
+      color: isDark ? '#e2e8f0' : '#1e293b',
     },
     buttonContainer: {
       flexDirection: 'row',
@@ -290,3 +340,4 @@ const getStyles = (colors, isDark, windowWidth) =>
       color: '#ffffff',
     },
   });
+};
