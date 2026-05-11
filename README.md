@@ -124,7 +124,7 @@ The frontend is organized around three pillars:
 ### Install
 
 ```bash
-git clone (https://github.com/Farhan22798/plot-vista-frontend.git)
+git clone https://github.com/Farhan22798/plot-vista-frontend.git
 cd PlotVista/frontend
 npm install
 ```
